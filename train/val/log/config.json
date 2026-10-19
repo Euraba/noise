@@ -1,5 +1,5 @@
 {
-  "script": "/root/noise/train/boostcut/run.py",
+  "script": "/root/noise/train/val/run.py",
   "world": 8,
   "preset": "38m",
   "model": {

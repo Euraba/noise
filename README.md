@@ -73,6 +73,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 7 | 4.008 | Associative credit memory as a prior for the draws | 1 h 46 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
 | 8 | 3.991 | Reduce population to 16k | 1 h 12 min | [@serdardoesml](https://github.com/serdardoesml) |
 | 9 | 3.945 | Boost → Cut: stagewise readout training, then credit along strong routes | 8 min | [@spicylemonade](https://github.com/spicylemonade) |
+| 10 | 3.728 | Cut with the attention externalities, by backward induction over depth | 9 min | [@Euraba](https://github.com/Euraba) |
 
 ### Track 2: speedrun to 4.2
 
