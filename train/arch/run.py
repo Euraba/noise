@@ -58,9 +58,8 @@ torch._dynamo.config.cache_size_limit = 64
 
 
 def model_config():
-    """The fixed GPT topology used by the current val experiment."""
-    return GPTConfig(sequence_len=2048, vocab_size=4096, n_layer=8, n_head=8,
-                     n_kv_head=8, n_embd=512, window_pattern='SSSL')
+    """Track 3: this folder's model.py defaults, which utils/eval.py also builds."""
+    return GPTConfig()
 
 
 @dataclass
