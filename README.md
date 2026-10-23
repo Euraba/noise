@@ -98,6 +98,7 @@ New track where any architecture is allowed!
 | - | - | - | - | - | - |
 | 1 | 3.767 | Dust w/ Adam, 24k population, lr cooldown | 5 h 17 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/val/dust.py) | - |
 | 2 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/arch/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh), [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
+| 3 | 3.358 | #2 on 6 blocks with hashed 2- and 3-gram tables summed into the embedding (Engram-style lookups, trained by the embedding credit); Cut's future and input-K probes scored by degree-2 moments in one fused kernel, routed future queries, bf16 products | 27 min | [Script](train/arch/run.py) | [@Euraba](https://github.com/Euraba) |
 
 ## What backprop gets
 
