@@ -572,6 +572,58 @@ def routed_output_change(dq, top_keys, top_values, top_p, rest):
     return dout + torch.expm1(-dlse) * rest.unsqueeze(1)
 
 
+@cache
+def readout_kernel():
+    import triton
+    import triton.language as tl
+    from triton.language.extra.cuda import libdevice
+
+    @triton.jit
+    def kernel(Delta, W, Base, Inv, Out, R, V, Probes: tl.constexpr, K: tl.constexpr,
+               BR: tl.constexpr, BV: tl.constexpr, BK: tl.constexpr):
+        rows = tl.program_id(0)*BR+tl.arange(0, BR)
+        live = rows < R
+        token = rows // Probes
+        inv = tl.load(Inv+rows, live, 0.)
+        total = tl.zeros((BR,), tl.float32)
+        for v0 in range(0, V, BV):
+            cols = v0+tl.arange(0, BV)
+            acc = tl.zeros((BR, BV), tl.float32)
+            for k0 in tl.static_range(0, K, BK):
+                ks = k0+tl.arange(0, BK)
+                d = tl.load(Delta+rows[:, None]*K+ks[None, :], live[:, None], 0.)
+                w = tl.load(W+ks[:, None]*V+cols[None, :], cols[None, :] < V, 0.)
+                acc = tl.dot(d, w, acc)
+            base = tl.load(Base+token[:, None]*V+cols[None, :], live[:, None] & (cols[None, :] < V), 0.)
+            z = (base+acc)*inv[:, None]
+            capped = 15*libdevice.tanh(z/15)
+            total += tl.sum(tl.where(cols[None, :] < V, tl.exp(capped), 0.), 1)
+        tl.store(Out+rows, tl.log(total), live)
+    return kernel
+
+
+@torch.library.custom_op('noise_record::readout_lse', mutates_args=())
+def readout_lse(delta: torch.Tensor, weight_t: torch.Tensor, base: torch.Tensor, inv: torch.Tensor) -> torch.Tensor:
+    """log sum_v exp(15 tanh(z_v / 15)), z = (base + delta @ weight_t) * inv, for delta [m, P, W] (bf16), weight_t
+    [W, V] (bf16), base [m, V], inv [m, P]: the chain's moved readout without writing the [m, P, V] logits."""
+    m, probes, width = delta.shape
+    if not delta.is_cuda:
+        z = (base.unsqueeze(1) + (delta @ weight_t).float()) * inv.unsqueeze(-1)
+        return torch.exp(15 * torch.tanh(z / 15)).sum(-1).log()
+    import triton
+    rows, vocab = m * probes, weight_t.shape[1]
+    out = torch.empty(rows, device=delta.device, dtype=torch.float32)
+    readout_kernel()[(triton.cdiv(rows, 64),)](
+        delta.contiguous(), weight_t.contiguous(), base.float().contiguous(), inv.float().contiguous(), out,
+        rows, vocab, probes, width, 64, 128, 64, num_warps=8, num_stages=3)
+    return out.view(m, probes)
+
+
+@readout_lse.register_fake
+def _(delta, weight_t, base, inv):
+    return torch.empty(delta.shape[:2], device=delta.device, dtype=torch.float32)
+
+
 def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc, w_out_t, weight_t, base,
                       target_logit_w, y, own=None, from_output=False, packed=False):
     """Forward differences of each token's loss along every move of one site, K/V held, MLPs restricted to
@@ -611,9 +663,8 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
     sq = xL.square().sum(-1, keepdim=True)
     dots = torch.einsum('md,mpd->mp', xL, delta)
     inv = torch.rsqrt((sq + 2 * dots + delta.square().sum(-1)) / xL.shape[-1] + EPS)
-    z = (base.unsqueeze(1) + (delta.to(torch.bfloat16) @ weight_t).float()) * inv.unsqueeze(-1)
     zy = (base.gather(1, y.clamp(min=0).unsqueeze(1)) + (delta * target_logit_w.unsqueeze(1)).sum(-1)) * inv
-    moved = torch.exp(15 * torch.tanh(z / 15)).sum(-1).log() - 15 * torch.tanh(zy / 15)
+    moved = readout_lse(delta.to(torch.bfloat16), weight_t, base, inv) - 15 * torch.tanh(zy / 15)
     inv0 = torch.rsqrt(sq / xL.shape[-1] + EPS)
     clean = torch.exp(15 * torch.tanh(base * inv0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(
         base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0 / 15)
