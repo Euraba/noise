@@ -43,18 +43,19 @@ def attention(q, k, v, window):
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 4096
-    n_layer: int = 8
+    n_layer: int = 6  # two blocks fewer than Dust's 8: the n-gram tables more than make up the loss
     n_head: int = 8
     n_kv_head: int = 8
     n_embd: int = 512
     # Per block, repeating: S = half-sequence window, L = full. The last block is always L.
     window_pattern: str = 'SSSL'
     feedback: bool = False  # the full-bandwidth second pass (backprop ruler: no gain on top of the n-grams)
-    # n-gram memory: n = 2..ngram_max, each hashed into ngram_heads tables of about ngram_rows rows (Engram's
-    # 5x the vocabulary); ngram_max < 2 turns it off.
+    # n-gram memory: n = 2..ngram_max, each hashed into ngram_heads tables of about ngram_rows rows (16 times
+    # Engram's 5x the vocabulary: lookups cost no compute, and backprop's loss kept falling to here); ngram_max < 2
+    # turns it off.
     ngram_max: int = 3
     ngram_heads: int = 8
-    ngram_rows: int = 5 * 4096
+    ngram_rows: int = 16 * 5 * 4096
 
 
 def norm(x):

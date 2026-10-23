@@ -111,10 +111,12 @@ class Settings:
     future_moments: bool = True  # score future probes with degree-2 moments over the receiving queries
     future_routed: bool = True  # future Q moves through the chain's routed keys (query_keys), not every key
     future_stacked: bool = True  # score every receiver of a source chunk at once (with future_moments)
+    future_fused: bool = True  # the stacked receivers' K/V changes and moment forms in one kernel (cuda)
     query_keys: int = 256   # moving key logits per head; 0 reruns all allowed logits
     key_sigma: float = 0.003
     key_chunk: int = 32
     key_moments: bool = True  # score input-K probes with degree-2 moments over the receiving queries
+    key_fused: bool = True  # form the input-K changes and their moment scores in one kernel (with key_moments)
     own_query_precision: str = 'bf16'  # the chain's own-query move products (the record: 'fp32', TF32 products)
     future_precision: str = 'bf16'  # the future probes' move products (the record: 'fp32', TF32 products)
     ngram_lr_scale: float = 300  # the n-gram tables' Adam rate, in units of lr (the token embedding's is 300)
@@ -473,10 +475,13 @@ def finite_attention_kernels():
                     probes[:, None] < Probes, 0)
         # Match both BF16 matmul output roundings of the original implementation.
         ds = tl.dot(q, tl.trans(k)).to(q.dtype).to(tl.float32) * (D ** -.5)
-        dlse = log1p(tl.sum(p[None, :] * expm1(ds, FAST), 1), FAST)
-        weights = (p[None, :] * expm1(ds - dlse[:, None], FAST)).to(v.dtype)
+        grown = expm1(ds, FAST)
+        dlse = log1p(tl.sum(p[None, :] * grown, 1), FAST)
+        shrink = expm1(-dlse, FAST)[:, None]
+        # expm1(ds - dlse) = grown + shrink (1 + grown): one exponential per logit, no cancellation
+        weights = (p[None, :] * (grown + shrink * (1 + grown))).to(v.dtype)
         moved = tl.dot(weights, v).to(v.dtype).to(tl.float32)
-        moved += expm1(-dlse, FAST)[:, None] * rest[None, :]
+        moved += shrink * rest[None, :]
         tl.store(Out + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
                  moved, probes[:, None] < Probes)
 
@@ -540,11 +545,11 @@ ROUTED = (False, True, 4)  # routed kernel: probe loop per program, fast expm1/l
 
 @torch.library.custom_op('noise_record::routed_response', mutates_args=())
 def routed_response(dq: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
-                    probabilities: torch.Tensor, rest: torch.Tensor) -> torch.Tensor:
+                    probabilities: torch.Tensor, rest: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     import triton
     m, probes, heads, width = dq.shape
     count = keys.shape[2]
-    out = torch.empty((m, probes, heads, width), device=dq.device, dtype=torch.float32)
+    out = torch.empty((m, probes, heads, width), device=dq.device, dtype=dtype)  # stored rounded to dtype
     loop, fast, warps = ROUTED
     finite_attention_kernels()[0][(m * heads,) if loop else (triton.cdiv(probes, 32), m * heads)](
         dq.contiguous(), keys.contiguous(), values.contiguous(), probabilities.contiguous(), rest.contiguous(),
@@ -553,8 +558,8 @@ def routed_response(dq: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
 
 
 @routed_response.register_fake
-def _(dq, keys, values, probabilities, rest):
-    return torch.empty(dq.shape, device=dq.device, dtype=torch.float32)
+def _(dq, keys, values, probabilities, rest, dtype):
+    return torch.empty(dq.shape, device=dq.device, dtype=dtype)
 
 
 @torch.library.custom_op('noise_record::key_response', mutates_args=())
@@ -588,20 +593,22 @@ def query_change_routed(x, delta, pos, w_q, top_keys, top_values, top_p, rest, w
     inv0 = torch.rsqrt(sq / width + EPS)
     inv = torch.rsqrt((sq + 2 * (r0 * dr).sum(-1, keepdim=True) + dr.square().sum(-1, keepdim=True)) / width + EPS)
     dq = dr * inv + r0 * (inv - inv0)
-    return move_product(routed_output_change(dq, top_keys, top_values, top_p, rest).flatten(-2), w_proj_t)
+    change = routed_output_change(dq, top_keys, top_values, top_p, rest, MOVE_DTYPE)
+    return move_product(change.flatten(-2), w_proj_t)
 
 
-def routed_output_change(dq, top_keys, top_values, top_p, rest):
+def routed_output_change(dq, top_keys, top_values, top_p, rest, dtype=torch.float32):
     """The attention output's finite change [m, P, H, D] when the processed query moves by dq [m, P, H, D] and
-    only its selected key logits move; the held remainder rescales exactly."""
+    only its selected key logits move; the held remainder rescales exactly. Returned in dtype, the precision of
+    the product the caller takes next."""
     width = dq.shape[-1]
     if dq.is_cuda and top_keys.dtype == torch.bfloat16 and width in (32, 64) and top_keys.shape[2] <= 256:
-        return routed_response(dq.to(top_keys.dtype), top_keys, top_values, top_p, rest)
+        return routed_response(dq.to(top_keys.dtype), top_keys, top_values, top_p, rest, dtype)
     ds = torch.einsum('mphd,mhkd->mphk', dq.to(top_keys.dtype), top_keys).float() * width ** -0.5
     p = top_p.unsqueeze(1)
     dlse = torch.log1p((p * torch.expm1(ds)).sum(-1, keepdim=True))
     dout = torch.einsum('mphk,mhkd->mphd', (p * torch.expm1(ds - dlse)).to(top_values.dtype), top_values).float()
-    return dout + torch.expm1(-dlse) * rest.unsqueeze(1)
+    return (dout + torch.expm1(-dlse) * rest.unsqueeze(1)).to(dtype)
 
 
 def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc, w_out_t, weight_t, base,
@@ -1305,6 +1312,12 @@ class Cut(Boost):
                     if xin.is_cuda and raw.shape[-1] in (32, 64):
                         # All directions share a source tile. The fused scorer
                         # reduces query tiles without writing H*P*Q*M intermediates.
+                        if moments is not None and s.key_fused:
+                            scores = fused_key_moment_scores(xin[sl], steps[sl], rows, projected_x[sl],
+                                                             projected_rows, raw[:, sl], cos[sl], sin[sl],
+                                                             moments[0][:, sl], moments[1][:, sl])
+                            estimate[r, sl] = decode_key_pairs(scores, steps[sl], rows) * (len(rows) / total_rows)
+                            continue
                         moves = prepared_key_moves(xin[sl], steps[sl], rows, projected_x[sl],
                                                    projected_rows, raw[:, sl], cos[sl], sin[sl])
                         if moments is not None:
@@ -1930,6 +1943,148 @@ def stacked_receiver_scores(move, coeffs, x, kraw, wkv, gate, ve, wg, cos, sin, 
     return (quadratic+linear).sum((0, 3, 4))
 
 
+@cache
+def receiver_moment_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def kernel(Proj, XProj, A, B, Kraw, Cos, Sin, Gate, Ve, Mk, Mv, Mkk, Mkv, Out,
+               M: tl.constexpr, P: tl.constexpr, H: tl.constexpr, D: tl.constexpr, BP: tl.constexpr,
+               EPS: tl.constexpr, PJ: tl.constexpr, PT: tl.constexpr, PPROBE: tl.constexpr, XROW: tl.constexpr,
+               VALUES: tl.constexpr):
+        # Proj strides PJ, PT, PPROBE per receiver, token and probe (PT 0: every token shares the probes'
+        # products); VALUES False: keys alone (no V, gate or V moments)
+        token, jh = tl.program_id(0), tl.program_id(1)
+        j, head = jh // H, jh % H
+        row = j * M + token  # (receiver, token)
+        d = tl.arange(0, D)
+        partner = (d + D // 2) % D  # rotate(u) = u cos + u[partner] sin, the sine signed by half
+        cos = tl.load(Cos + token * (D // 2) + d % (D // 2))
+        sin = tl.load(Sin + token * (D // 2) + d % (D // 2)) * tl.where(d < D // 2, 1.0, -1.0)
+        kraw = Kraw + (row * H + head) * D
+        r0 = tl.load(kraw + d) * cos + tl.load(kraw + partner) * sin
+        square = tl.sum(r0 * r0, 0)
+        inv0 = tl.rsqrt(square / D + EPS)
+        xproj = XProj + row * XROW + head * D
+        xk, xk_partner = tl.load(xproj + d), tl.load(xproj + partner)
+        moment = (jh * M + token) * D
+        mk = tl.load(Mk + moment + d)
+        mkk = tl.load(Mkk + (moment + d[:, None]) * D + d[None, :])
+        if VALUES:
+            xv = tl.load(xproj + H * D + d)
+            ve = tl.load(Ve + (row * H + head) * D + d)
+            mv = tl.load(Mv + moment + d)
+            mkv = tl.load(Mkv + (moment + d[:, None]) * D + d[None, :])
+        for p0 in range(0, P, BP):
+            probe = p0 + tl.arange(0, BP)
+            valid = probe < P
+            a = tl.load(A + row * P + probe, valid, 0)[:, None]
+            b = tl.load(B + row * P + probe, valid, 0)[:, None]
+            proj = Proj + j * PJ + token * PT + probe[:, None] * PPROBE + head * D
+            k = a * tl.load(proj + d[None, :], valid[:, None], 0).to(tl.float32) + b * xk[None, :]
+            k_partner = a * tl.load(proj + partner[None, :], valid[:, None], 0).to(tl.float32) + b * xk_partner[None, :]
+            dr = k * cos[None, :] + k_partner * sin[None, :]
+            moved = tl.rsqrt((square + 2 * tl.sum(r0[None, :] * dr, 1) + tl.sum(dr * dr, 1)) / D + EPS)[:, None]
+            dk = dr * moved + r0[None, :] * (moved - inv0)
+            score = (tl.dot(dk, mkk) + mk[None, :]) * dk
+            if VALUES:
+                gate = tl.load(Gate + (row * P + probe) * H + head, valid, 0)[:, None]
+                dv = (a * tl.load(proj + H * D + d[None, :], valid[:, None], 0).to(tl.float32) + b * xv[None, :]
+                      + gate * ve[None, :])
+                score += (tl.dot(dk, mkv) + mv[None, :]) * dv
+            tl.store(Out + (jh * M + token) * P + probe, tl.sum(score, 1), valid)
+
+    return kernel
+
+
+RECEIVERS = (64, 4)  # receiver_moments kernel: probe block, warps (bench.py's choice)
+
+
+@torch.library.custom_op('noise_record::receiver_moments', mutates_args=())
+def receiver_moments(proj: torch.Tensor, xproj: torch.Tensor, a: torch.Tensor, b: torch.Tensor, kraw: torch.Tensor,
+                     cos: torch.Tensor, sin: torch.Tensor, gate: torch.Tensor, ve: torch.Tensor, mk: torch.Tensor,
+                     mv: torch.Tensor, mkk: torch.Tensor, mkv: torch.Tensor) -> torch.Tensor:
+    """Moment scores [J H, m, P] of each receiver j and head: its input change a proj + b xproj (proj [m, P, J, 2W]
+    the move's K/V products, contiguous as one matmul leaves them; xproj [J, m, 2W] the clean ones, a and b
+    [J, m, P]) through RoPE and QK-norm to dk, plus the VE gate change gate [J, m, P, H] times ve to dv; moments
+    as in stacked_receiver_scores."""
+    m, P, J, width = proj.shape
+    heads, hd = kraw.shape[-2:]
+    assert proj.is_contiguous()  # a copy would cost more than the kernel
+    out = torch.empty((J * heads, m, P), device=proj.device, dtype=torch.float32)
+    block, warps = RECEIVERS
+    receiver_moment_kernel()[(m, J * heads)](
+        proj, *(t.contiguous() for t in (xproj, a, b, kraw, cos, sin, gate, ve, mk, mv, mkk, mkv)), out,
+        m, P, heads, hd, block, EPS, width, P * J * width, J * width, width, True, num_warps=warps)
+    return out
+
+
+@receiver_moments.register_fake
+def _(proj, xproj, a, b, kraw, cos, sin, gate, ve, mk, mv, mkk, mkv):
+    return proj.new_empty((proj.shape[2] * kraw.shape[-2], *proj.shape[:2]), dtype=torch.float32)
+
+
+@torch.library.custom_op('noise_record::key_moments', mutates_args=())
+def key_input_moments(proj: torch.Tensor, xproj: torch.Tensor, a: torch.Tensor, b: torch.Tensor, kraw: torch.Tensor,
+                      cos: torch.Tensor, sin: torch.Tensor, mk: torch.Tensor, mkk: torch.Tensor) -> torch.Tensor:
+    """receiver_moments for keys alone, every token sharing the probes' K products proj [P, W]: scores [H, m, P]
+    of the key changes a proj + b xproj (xproj [m, W], a and b [m, P]); kraw [m, H, hd], moments [H, m, ...]."""
+    P, m = proj.shape[0], xproj.shape[0]
+    heads, hd = kraw.shape[-2:]
+    out = torch.empty((heads, m, P), device=proj.device, dtype=torch.float32)
+    block, warps = RECEIVERS
+    mk, mkk = mk.contiguous(), mkk.contiguous()
+    receiver_moment_kernel()[(m, heads)](
+        proj.contiguous(), xproj.contiguous(), a.contiguous(), b.contiguous(), kraw.contiguous(), cos.contiguous(),
+        sin.contiguous(), mk, mk, mk, mk, mkk, mkk, out,
+        m, P, heads, hd, block, EPS, 0, 0, heads * hd, heads * hd, False, num_warps=warps)
+    return out
+
+
+@key_input_moments.register_fake
+def _(proj, xproj, a, b, kraw, cos, sin, mk, mkk):
+    return proj.new_empty((kraw.shape[-2], xproj.shape[0], proj.shape[0]), dtype=torch.float32)
+
+
+@torch.compile(dynamic=False)
+def fused_key_moment_scores(x, steps, rows, projected_x, projected_rows, k_raw, cos, sin, mk, mkk):
+    """key_moment_scores(prepared_key_moves(...), mk, mkk) [H, 2P, m], the key changes formed inside the
+    receiver_moments kernel: each pair's RMSNorm responses inv_up/down, then a proj + b xproj as there."""
+    width = x.shape[-1]
+    square = x.square().sum(-1, keepdim=True)
+    dots = x @ rows.T
+    moved_square = square + steps.square() * rows.square().sum(-1)
+    inv0 = torch.rsqrt(square / width + EPS)
+    inv_up = torch.rsqrt((moved_square + 2 * steps * dots) / width + EPS)
+    inv_down = torch.rsqrt((moved_square - 2 * steps * dots) / width + EPS)
+    a = torch.cat((steps * inv_up, -steps * inv_down), 1)
+    b = torch.cat((inv_up, inv_down), 1) - inv0
+    return key_input_moments(torch.cat((projected_rows, projected_rows)), projected_x, a, b, k_raw.transpose(0, 1),
+                             cos, sin, mk, mkk).transpose(1, 2)
+
+
+@torch.compile(dynamic=False)
+def fused_receiver_scores(move, coeffs, x, kraw, wkv, gate, ve, wg, cos, sin, mk, mv, mkk, mkv):
+    """stacked_receiver_scores with every per-direction K/V change and moment form in one kernel
+    (receiver_moments); only the move's K/V products and the small gate products stay separate."""
+    J, m, width = x.shape
+    eps = torch.finfo(x.dtype).eps
+    c = coeffs[:, None, None]
+    square = x.square().sum(-1)[..., None]
+    inv = torch.rsqrt(square/width+eps)
+    moved = torch.rsqrt((square+2*c*(x[:, :, None]*move).sum(-1)+c*c*move.square().sum(-1))/width+eps)
+    a, b = c*moved, moved-inv  # norm_delta(x_j, c_j move) = a move + b x_j
+    p = move.shape[1]
+    proj = (move.reshape(m*p, width).to(FUTURE_DTYPE) @ wkv.reshape(-1, width).to(FUTURE_DTYPE).T).view(m, p, J, -1)
+    g = wg.shape[-1]
+    dg = (a[..., None]*torch.einsum('mpg,jhg->jmph', move[..., :g], wg)
+          + b[..., None]*torch.einsum('jmg,jhg->jmh', x[..., :g], wg)[:, :, None])
+    gate_change = 2*((gate[:, :, None]+dg).sigmoid()-gate[:, :, None].sigmoid())
+    return receiver_moments(proj, torch.einsum('jmw,jow->jmo', x, wkv), a, b, kraw, cos, sin, gate_change, ve,
+                            mk, mv, mkk, mkv).sum(0)
+
+
 @torch.compile(dynamic=False)
 def query_mlp_moves(raw, directions, step, cos, sin, keys, values, probabilities, weight,
                     base, mid, hidden, w_fc, w_out):
@@ -1948,15 +2103,15 @@ def routed_query_mlp_moves(raw, directions, step, cos, sin, top_keys, top_values
     c, s = cos[:, None, None], sin[:, None, None]
     r0 = rotate(raw.reshape(m, 1, heads, hd), c, s)
     dr = rotate(delta.reshape(m, 2*p, heads, hd), c, s)
-    change = routed_output_change(norm_delta(r0, dr), top_keys, top_values, top_p, rest)
+    change = routed_output_change(norm_delta(r0, dr), top_keys, top_values, top_p, rest, FUTURE_DTYPE)
     return mlp_output_moves(mid, future_linear(change.flatten(-2), weight), hidden, w_fc, w_out)
 
 
 class FiniteFuture:
     def __init__(self, estimator, source_layers=4, tokens=64, chunk=512, sigma=.01, seed=9181,
-                 query_mlp=True, timing=True, moments=False, stacked=False):
+                 query_mlp=True, timing=True, moments=False, stacked=False, fused=False):
         self.e = estimator
-        self.moments, self.stacked = moments, stacked
+        self.moments, self.stacked, self.fused = moments, stacked, fused
         self.routed = None  # the chain's routed own-query context of this sequence, when set
         self.source_layers, self.tokens, self.chunk = source_layers, tokens, chunk
         self.sigma, self.seed = sigma, seed
@@ -2077,7 +2232,8 @@ class FiniteFuture:
                                                 x.new_zeros(shape) for c in ctxs])
         wg = torch.stack([c["wg"] if c["wg"] is not None else x.new_zeros(heads, g) for c in ctxs])
         moments = [torch.stack([c["moments"][k][:, sl] for c in ctxs]) for k in range(4)]
-        return partial(stacked_receiver_scores, coeffs=torch.stack([coefficient for _, coefficient in receivers]),
+        scores = fused_receiver_scores if self.fused and x.is_cuda else stacked_receiver_scores
+        return partial(scores, coeffs=torch.stack([coefficient for _, coefficient in receivers]),
                        x=x, kraw=kraw, wkv=torch.stack([c["wkv"] for c in ctxs]),
                        gate=some("gate", (x.shape[1], heads)), ve=some("ve", kraw.shape[1:]), wg=wg,
                        cos=self.cos[sl], sin=self.sin[sl], mk=moments[0], mv=moments[1], mkk=moments[2],
@@ -2169,7 +2325,7 @@ def add_future_gradients(estimator, gradients):
     future = FiniteFuture(e, source_layers=s.future_layers, tokens=s.future_tokens,
                           chunk=s.future_chunk, sigma=s.future_sigma, seed=seed,
                           query_mlp=True, timing=False, moments=s.future_moments,
-                          stacked=s.future_stacked)
+                          stacked=s.future_stacked, fused=s.future_fused)
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
         future.routed = getattr(e, 'routed', {}).get(sequence)
