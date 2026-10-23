@@ -100,12 +100,12 @@ class Settings:
     path_scalars: bool = True  # also contract input-path credit into the linear mixing coefficients
     key_path_draws: int = 512  # independent input-K central pairs per token
     key_path_sigma: float = 0.01  # relative input RMS step
-    key_path_tokens: int = 64  # source-token chunk; every allowed query contributes
+    key_path_tokens: int = 256  # source-token chunk; every allowed query contributes
     gate_path: bool = True  # independent full-cycle input probes through the VE gate
     gate_path_sigma: float = 0.01  # relative input RMS step
     future_draws: int = 128  # independent hidden/Q/WTE probes scored at every later raw hub
     future_layers: int = 4  # first blocks whose hidden and Q outputs receive this correction
-    future_tokens: int = 128
+    future_tokens: int = 512
     future_chunk: int = 512
     future_sigma: float = 0.01  # source-relative RMS; Q includes its own complete MLP response
     future_moments: bool = True  # score future probes with degree-2 moments over the receiving queries
@@ -2842,8 +2842,8 @@ def main():
     # Execution chunks only: the default command reproduces the logged algorithm and budgets.
     parser.add_argument('--chain-tokens', type=int, default=512)
     parser.add_argument('--key-chunk', type=int, default=32)
-    parser.add_argument('--key-path-tokens', type=int, default=64)
-    parser.add_argument('--future-tokens', type=int, default=128)
+    parser.add_argument('--key-path-tokens', type=int, default=256)
+    parser.add_argument('--future-tokens', type=int, default=512)
     parser.add_argument('--future-chunk', type=int, default=512)
     args = parser.parse_args()
     for key in ('steps', 'stop_after_step'):
