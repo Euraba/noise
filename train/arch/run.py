@@ -109,9 +109,11 @@ class Settings:
     future_tokens: int = 128
     future_chunk: int = 512
     future_sigma: float = 0.01  # source-relative RMS; Q includes its own complete MLP response
+    future_moments: bool = True  # score future probes with degree-2 moments over the receiving queries
     query_keys: int = 256   # moving key logits per head; 0 reruns all allowed logits
     key_sigma: float = 0.003
     key_chunk: int = 32
+    key_moments: bool = True  # score input-K probes with degree-2 moments over the receiving queries
 
     def __post_init__(self):
         width, hidden = self.model.n_embd, 4 * self.model.n_embd
@@ -678,6 +680,24 @@ def key_input_prepared_derivatives(x, steps, rows, projected_x, projected_rows, 
     return (scores[:, :probes] - scores[:, probes:]) / (2 * steps)
 
 
+def key_moments(qp, A, C):
+    """Degree-2 moments over each source token's queries for keys alone (future_moments with no value change; A
+    holds the queries that see each source, the source's own query included): key_moment_scores is the key
+    kernel's change / (1 + change) * c to third order in the logit change."""
+    dh = qp.shape[-1]
+    ac = A*C
+    mk = torch.einsum('hst,hsd->htd', ac, qp)*dh**-.5
+    qq = (qp[..., :, None]*qp[..., None, :]).flatten(-2)
+    mkk = torch.bmm((ac*(.5-A)).transpose(1, 2), qq).view(*mk.shape, dh)/dh
+    return mk, mkk
+
+
+@torch.compile(dynamic=False)
+def key_moment_scores(dk, mk, mkk):
+    """Summed key scores [H, P, M] of key changes dk [H, P, M, D] from the moments of their tokens M."""
+    return (torch.einsum('hpmd,hmde->hpme', dk, mkk)*dk+dk*mk[:, None]).sum(-1)
+
+
 @torch.compile(dynamic=False)
 def decode_key_pairs(scores, steps, rows):
     return decode_local_response(scores.sum(0).T, steps, rows) / len(rows)
@@ -1218,6 +1238,7 @@ class Cut(Boost):
                 context = self.key_context(i, r, target)
                 qp, _, raw, cos, sin, A, C = context
                 raw_credit[r] = self.key_errors_from_context(i, context).transpose(0, 1).reshape(d.length, self.width)
+                moments = key_moments(qp, A, C) if s.key_moments and self.device.type == 'cuda' else None
                 xin = d.blocks[i][r].float()
                 projected_x = xin @ w_key.T
                 steps = s.key_path_sigma * xin.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
@@ -1234,8 +1255,11 @@ class Cut(Boost):
                         # reduces query tiles without writing H*P*Q*M intermediates.
                         moves = prepared_key_moves(xin[sl], steps[sl], rows, projected_x[sl],
                                                    projected_rows, raw[:, sl], cos[sl], sin[sl])
-                        scores = fused_key_response(qp[:, qs], moves, A[:, qs, sl], C[:, qs, sl],
-                                                    t0, qs.start, self.model.window_sizes[i][0])
+                        if moments is not None:
+                            scores = key_moment_scores(moves, moments[0][:, sl], moments[1][:, sl])
+                        else:
+                            scores = fused_key_response(qp[:, qs], moves, A[:, qs, sl], C[:, qs, sl],
+                                                        t0, qs.start, self.model.window_sizes[i][0])
                         estimate[r, sl] = decode_key_pairs(scores, steps[sl], rows) * (len(rows) / total_rows)
                         continue
                     derivatives = torch.empty(len(xin[sl]), len(rows), device=self.device)
@@ -1664,6 +1688,35 @@ def _(q, target, dk, dv, a, contrast, source_start, window):
                        dtype=torch.float32 if q.is_cuda else q.dtype)
 
 
+def future_moments(q, target, a, contrast, window):
+    """Degree-2 moments over each source token's receiving queries (one layer, all heads), so that moment_scores
+    gives joint_scores' exact single-column update to third order in the change, for every direction at once.
+
+    With u = q_s.dk / sqrt(D), w = target_s.dv and changed = a (e^u - 1), the update
+    (changed c + (a + changed) w) / (1 + changed) = a c u + (a c / 2 - a^2 c) u^2 + a w + (a - a^2) u w + O(3),
+    so its sum over the queries s is linear and quadratic forms in (dk, dv) with per-source moments: the
+    construction of the merged track 2 kernels (#29), here over the future probes' receivers.
+    """
+    h, t, dh = q.shape
+    s = torch.arange(t, device=q.device)
+    lag = s[:, None]-s[None, :]
+    a = a*((lag > 0) & (lag <= window))  # [head, query, source], the queries that see the source
+    ac = a*contrast
+    mk = torch.einsum('hst,hsd->htd', ac, q)*dh**-.5
+    mv = torch.einsum('hst,hsd->htd', a, target)
+    qq = (q[..., :, None]*q[..., None, :]).flatten(-2)
+    qg = (q[..., :, None]*target[..., None, :]).flatten(-2)
+    mkk = torch.bmm((ac*(.5-a)).transpose(1, 2), qq).view(h, t, dh, dh)/dh
+    mkv = torch.bmm((a-a*a).transpose(1, 2), qg).view(h, t, dh, dh)*dh**-.5
+    return mk, mv, mkk, mkv
+
+
+def moment_scores(dk, dv, mk, mv, mkk, mkv):
+    """Summed future scores [P, M] of key and value changes [H, P, M, D] from the moments of their tokens M."""
+    quadratic = torch.einsum('hpmd,hmde->hpme', dk, mkk)*dk+torch.einsum('hpmd,hmde->hpme', dk, mkv)*dv
+    return (quadratic+dk*mk[:, None]+dv*mv[:, None]).sum((0, 3))
+
+
 def signed_hidden_moves(raw, directions, step, weight):
     """Exact paired squared-ReLU responses for sign directions, with one large GEMM.
 
@@ -1784,6 +1837,12 @@ def receiver_scores(move, coefficient, x, kraw, gate, ve, wkv, wg, cos, sin,
     return fused_scores(q, target, dk, dv, a, contrast, start, window).sum(0).T
 
 
+@torch.compile(dynamic=True)
+def receiver_moment_scores(move, coefficient, x, kraw, gate, ve, wkv, wg, cos, sin, mk, mv, mkk, mkv):
+    dk, dv = receiver_changes(x, move*coefficient, kraw, gate, ve, wkv, wg, cos, sin)
+    return moment_scores(dk, dv, mk, mv, mkk, mkv).T
+
+
 @torch.compile(dynamic=False)
 def query_mlp_moves(raw, directions, step, cos, sin, keys, values, probabilities, weight,
                     base, mid, hidden, w_fc, w_out):
@@ -1793,8 +1852,9 @@ def query_mlp_moves(raw, directions, step, cos, sin, keys, values, probabilities
 
 class FiniteFuture:
     def __init__(self, estimator, source_layers=4, tokens=64, chunk=512, sigma=.01, seed=9181,
-                 query_mlp=True, timing=True):
+                 query_mlp=True, timing=True, moments=False):
         self.e = estimator
+        self.moments = moments
         self.source_layers, self.tokens, self.chunk = source_layers, tokens, chunk
         self.sigma, self.seed = sigma, seed
         self.query_mlp = query_mlp
@@ -1832,6 +1892,8 @@ class FiniteFuture:
                 target=target, gate=gate, ve=ve, wg=wg,
                 wkv=torch.cat((block.attn.c_k.weight, block.attn.c_v.weight)).float(),
                 window=model.window_sizes[i][0]))
+            if self.moments:
+                contexts[-1]["moments"] = future_moments(q, target, a, contrast, model.window_sizes[i][0])
             if self.query_mlp and i < self.source_layers:
                 contexts[-1]["source_mlp"] = (
                     d.blocks[i][sequence].float()+d.outputs[prefix+"c_proj"][sequence].float(),
@@ -1870,13 +1932,17 @@ class FiniteFuture:
         scorers = []
         for j, coefficient in receivers:
             ctx = self.contexts[j]
-            scorers.append(partial(receiver_scores, coefficient=coefficient,
-                x=ctx["x"][sl], kraw=ctx["kraw"][sl],
-                gate=None if ctx["gate"] is None else ctx["gate"][sl],
-                ve=None if ctx["ve"] is None else ctx["ve"][sl],
-                wkv=ctx["wkv"], wg=ctx["wg"], cos=self.cos[sl], sin=self.sin[sl],
-                q=ctx["q"], target=ctx["target"], a=ctx["a"][:, :, sl],
-                contrast=ctx["contrast"][:, :, sl], start=start, window=ctx["window"]))
+            changes = dict(coefficient=coefficient, x=ctx["x"][sl], kraw=ctx["kraw"][sl],
+                           gate=None if ctx["gate"] is None else ctx["gate"][sl],
+                           ve=None if ctx["ve"] is None else ctx["ve"][sl],
+                           wkv=ctx["wkv"], wg=ctx["wg"], cos=self.cos[sl], sin=self.sin[sl])
+            if "moments" in ctx:
+                mk, mv, mkk, mkv = (m[:, sl] for m in ctx["moments"])
+                scorers.append(partial(receiver_moment_scores, **changes, mk=mk, mv=mv, mkk=mkk, mkv=mkv))
+            else:
+                scorers.append(partial(receiver_scores, **changes, q=ctx["q"], target=ctx["target"],
+                                       a=ctx["a"][:, :, sl], contrast=ctx["contrast"][:, :, sl], start=start,
+                                       window=ctx["window"]))
 
         def score(move):
             if not scorers:
@@ -1972,7 +2038,7 @@ def add_future_gradients(estimator, gradients):
                              generator=d.shared_generator if e.split > 1 else d.generator).item())
     future = FiniteFuture(e, source_layers=s.future_layers, tokens=s.future_tokens,
                           chunk=s.future_chunk, sigma=s.future_sigma, seed=seed,
-                          query_mlp=True, timing=False)
+                          query_mlp=True, timing=False, moments=s.future_moments)
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
         future.prepare(sequence)
