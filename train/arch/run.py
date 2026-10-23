@@ -746,6 +746,11 @@ class Capture:
                 self.clean_loss = self.model(x, y, loss_reduction='none').view_as(y).float()
         finally:
             self.capturing = False
+        if 'feedback' in self.outputs:
+            # Track 3: the hooks kept the second pass, whose embedding is wte + feedback(h[t-1]); every
+            # embedding probe moves that sum, and h[t-1] (the first pass) is a fixed input, like the token
+            self.outputs['transformer.wte'] = self.outputs['transformer.wte'] + self.outputs['feedback'].to(
+                self.outputs['transformer.wte'].dtype)
         with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == 'cuda'):
             self.x0 = norm(self.outputs['transformer.wte'])
 
@@ -761,6 +766,13 @@ class Capture:
             weight_error = torch.zeros_like(module.weight, dtype=torch.float32)
             return weight_error.index_add_(0, x.reshape(-1), error.reshape(-1, error.shape[-1]))
         return torch.einsum('btd,bti->di', error, x)
+
+    def embedding_gradients(self, gradients, credit):
+        """wte's gradient from the credit at the embedding output, and feedback's from the same credit: the
+        feedback enters by addition there, so its credit takes no extra step."""
+        gradients['transformer.wte.weight'] = self.reassemble('transformer.wte', credit)
+        if 'feedback' in self.inputs:
+            gradients['feedback.weight'] = self.reassemble('feedback', credit)
 
 class Boost:
     """Phase 1: stagewise credit, each sub-block against the shared head reading the stream right after it."""
@@ -1098,7 +1110,7 @@ class Boost:
         self.internals(gradients, targets, b, t)
         e = d.outputs['transformer.wte'].float().flatten(0, 1)
         emb = self.embedding_block0(e, yf.view(b, t), x)
-        gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', emb.view(b, t, self.width))
+        d.embedding_gradients(gradients, emb.view(b, t, self.width))
         scalars = torch.zeros(2, L, device=self.device)
         step = s.scalar_step
         for i in range(self.part, L, self.split):
@@ -1498,7 +1510,7 @@ class Cut(Boost):
         self.measured = dict(chain=chain, g_top=g_top, targets=targets)
         self.internals(gradients, targets, b, t, value_targets or None, self._input_key_errors, raw_values)
         self._input_key_errors = None
-        gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', chain['emb'].view(b, t, self.width))
+        d.embedding_gradients(gradients, chain['emb'].view(b, t, self.width))
         gradients['resid_lambdas'], gradients['x0_lambdas'] = scalars[0], scalars[1]
         for name, p in model.named_parameters():
             if name not in gradients:
@@ -1507,7 +1519,7 @@ class Cut(Boost):
             # internals split or average their own: keys share dims, queries share draws, hidden units share units)
             for name in list(gradients):
                 if name == 'lm_head.weight' or name.endswith('c_proj.weight') or name in (
-                        'transformer.wte.weight', 'resid_lambdas', 'x0_lambdas'):
+                        'transformer.wte.weight', 'feedback.weight', 'resid_lambdas', 'x0_lambdas'):
                     gradients[name] = torch.zeros_like(gradients[name])
         if s.future_draws:
             # Use this capture's original measured hub targets, never corrected
@@ -1962,6 +1974,9 @@ def add_future_gradients(estimator, gradients):
                 credit = credit * (raw+step > 0)[None]
             if site == 'transformer.wte':
                 gradient.index_add_(0, inputs.flatten(), credit[0].flatten(0, -2))
+                if 'feedback' in d.inputs:
+                    gradients['feedback.weight'].addmm_(credit[0].flatten(0, -2).T,
+                                                        d.inputs['feedback'][sequence].flatten(0, -2))
             else:
                 gradient.addmm_(credit[0].T, inputs)
         future.contexts = None
