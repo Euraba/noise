@@ -588,7 +588,7 @@ def readout_kernel():
         for v0 in range(0, V, BV):
             cols = v0+tl.arange(0, BV)
             acc = tl.zeros((BR, BV), tl.float32)
-            for k0 in range(0, K, BK):
+            for k0 in tl.static_range(0, K, BK):
                 ks = k0+tl.arange(0, BK)
                 d = tl.load(Delta+rows[:, None]*K+ks[None, :], live[:, None], 0.)
                 w = tl.load(W+ks[:, None]*V+cols[None, :], cols[None, :] < V, 0.)
