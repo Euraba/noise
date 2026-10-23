@@ -116,6 +116,7 @@ class Settings:
     key_chunk: int = 32
     key_moments: bool = True  # score input-K probes with degree-2 moments over the receiving queries
     own_query_precision: str = 'bf16'  # the chain's own-query move products (the record: 'fp32', TF32 products)
+    ngram_lr_scale: float = 300  # the n-gram tables' Adam rate, in units of lr (the token embedding's is 300)
 
     def __post_init__(self):
         width, hidden = self.model.n_embd, 4 * self.model.n_embd
@@ -2376,7 +2377,8 @@ def make_optimizer(model, recipe, steps):
         if name.startswith('transformer.h.') and parameter.ndim == 2 and 've_gate' not in name:
             matrices.append(parameter)
             continue
-        scale = 300 if ('wte' in name or 'value_embeds' in name or 'ngram' in name) else 30 if 'lambdas' in name else 1
+        scale = (recipe.ngram_lr_scale if 'ngram' in name else 300 if ('wte' in name or 'value_embeds' in name)
+                 else 30 if 'lambdas' in name else 1)
         groups.setdefault(scale, []).append(parameter)
     adam = torch.optim.AdamW(
         [{'params': ps, 'lr': recipe.lr * scale} for scale, ps in groups.items()],
