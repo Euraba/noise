@@ -374,7 +374,7 @@ def stage_readout(x0, out, mix, wproj, weight, y):
 def norm_difference(x, delta):
     """norm(x + delta) - norm(x), exactly: x (m, W) clean, delta (m, P, W) moves."""
     sq = x.square().sum(-1, keepdim=True)
-    dots = torch.einsum('md,mpd->mp', x, delta)
+    dots = (x.unsqueeze(1) * delta).sum(-1)  # a fused reduction, not a batched GEMV
     inv0 = torch.rsqrt(sq / x.shape[-1] + EPS)
     inv = torch.rsqrt((sq + 2 * dots + delta.square().sum(-1)) / x.shape[-1] + EPS)
     return delta * inv.unsqueeze(-1) + x.unsqueeze(1) * (inv - inv0).unsqueeze(-1)
@@ -454,24 +454,26 @@ def finite_attention_kernels():
     def routed(Q, K, V, P, Rest, Out,
                Probes: tl.constexpr, Heads: tl.constexpr, Keys: tl.constexpr, D: tl.constexpr,
                BP: tl.constexpr, BK: tl.constexpr):
-        token, head = tl.program_id(1) // Heads, tl.program_id(1) % Heads
-        probes = tl.program_id(0) * BP + tl.arange(0, BP)
+        # One program per (token, head): its routed keys and values load once for every probe.
+        token, head = tl.program_id(0) // Heads, tl.program_id(0) % Heads
         keys, features = tl.arange(0, BK), tl.arange(0, D)
-        q = tl.load(Q + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
-                    probes[:, None] < Probes, 0)
         offsets = ((token * Heads + head) * Keys + keys[:, None]) * D + features[None, :]
         k = tl.load(K + offsets, keys[:, None] < Keys, 0)
         v = tl.load(V + offsets, keys[:, None] < Keys, 0)
         p = tl.load(P + (token * Heads + head) * Keys + keys, keys < Keys, 0)
-        # Match both BF16 matmul output roundings of the original implementation.
-        ds = tl.dot(q, tl.trans(k)).to(q.dtype).to(tl.float32) * (D ** -.5)
-        dlse = libdevice.log1p(tl.sum(p[None, :] * libdevice.expm1(ds), 1))
-        weights = (p[None, :] * libdevice.expm1(ds - dlse[:, None])).to(v.dtype)
-        moved = tl.dot(weights, v).to(v.dtype).to(tl.float32)
         rest = tl.load(Rest + (token * Heads + head) * D + features)
-        moved += libdevice.expm1(-dlse)[:, None] * rest[None, :]
-        tl.store(Out + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
-                 moved, probes[:, None] < Probes)
+        for p0 in range(0, Probes, BP):
+            probes = p0 + tl.arange(0, BP)
+            q = tl.load(Q + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
+                        probes[:, None] < Probes, 0)
+            # Match both BF16 matmul output roundings of the original implementation.
+            ds = tl.dot(q, tl.trans(k)).to(q.dtype).to(tl.float32) * (D ** -.5)
+            dlse = libdevice.log1p(tl.sum(p[None, :] * libdevice.expm1(ds), 1))
+            weights = (p[None, :] * libdevice.expm1(ds - dlse[:, None])).to(v.dtype)
+            moved = tl.dot(weights, v).to(v.dtype).to(tl.float32)
+            moved += libdevice.expm1(-dlse)[:, None] * rest[None, :]
+            tl.store(Out + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
+                     moved, probes[:, None] < Probes)
 
     @triton.jit
     def key_response(Q, DK, A, C, Out,
@@ -513,7 +515,7 @@ def routed_response(dq: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
     m, probes, heads, width = dq.shape
     count = keys.shape[2]
     out = torch.empty((m, probes, heads, width), device=dq.device, dtype=torch.float32)
-    finite_attention_kernels()[0][(triton.cdiv(probes, 32), m * heads)](
+    finite_attention_kernels()[0][(m * heads,)](
         dq.contiguous(), keys.contiguous(), values.contiguous(), probabilities.contiguous(), rest.contiguous(),
         out, probes, heads, count, width, 32, max(16, triton.next_power_of_2(count)), num_warps=4)
     return out
@@ -608,7 +610,7 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
         up, down = F.relu(h + dh), F.relu(h)
         delta = delta + torch.bmm(((up - down) * (up + down)).to(wo.dtype), wo).float()
     sq = xL.square().sum(-1, keepdim=True)
-    dots = torch.einsum('md,mpd->mp', xL, delta)
+    dots = (xL.unsqueeze(1) * delta).sum(-1)  # a fused reduction, not a batched GEMV
     inv = torch.rsqrt((sq + 2 * dots + delta.square().sum(-1)) / xL.shape[-1] + EPS)
     z = (base.unsqueeze(1) + (delta.to(torch.bfloat16) @ weight_t).float()) * inv.unsqueeze(-1)
     zy = (base.gather(1, y.clamp(min=0).unsqueeze(1)) + (delta * target_logit_w.unsqueeze(1)).sum(-1)) * inv
@@ -1875,7 +1877,7 @@ def stacked_receiver_scores(move, coeffs, x, kraw, wkv, gate, ve, wg, cos, sin, 
     c = coeffs[:, None, None]
     square = x.square().sum(-1)[..., None]  # [J, m, 1]
     inv = torch.rsqrt(square/width+eps)
-    moved = torch.rsqrt((square+2*c*torch.einsum('jmw,mpw->jmp', x, move)+c*c*move.square().sum(-1))/width+eps)
+    moved = torch.rsqrt((square+2*c*(x[:, :, None]*move).sum(-1)+c*c*move.square().sum(-1))/width+eps)
     proj = torch.einsum('mpw,jow->jmpo', move, wkv)
     xproj = torch.einsum('jmw,jow->jmo', x, wkv)[:, :, None]
     dproj = ((c*moved)[..., None]*proj+(moved-inv)[..., None]*xproj).view(J, m, p, 2, heads, hd)
