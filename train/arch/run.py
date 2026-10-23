@@ -116,6 +116,7 @@ class Settings:
     key_chunk: int = 32
     key_moments: bool = True  # score input-K probes with degree-2 moments over the receiving queries
     own_query_precision: str = 'bf16'  # the chain's own-query move products (the record: 'fp32', TF32 products)
+    future_precision: str = 'bf16'  # the future probes' move products (the record: 'fp32', TF32 products)
     ngram_lr_scale: float = 300  # the n-gram tables' Adam rate, in units of lr (the token embedding's is 300)
 
     def __post_init__(self):
@@ -626,6 +627,12 @@ chain_chunk = torch.compile(chain_chunk_eager, dynamic=False)
 chain_chunk_own = torch.compile(chain_chunk_eager, dynamic=True)
 KEY_BUCKET = 256
 MOVE_DTYPE = torch.bfloat16  # the own-query move products of the chain replay (Settings.own_query_precision)
+FUTURE_DTYPE = torch.bfloat16  # the future probes' move products (Settings.future_precision)
+
+
+def future_linear(move, weight):
+    """F.linear of a future probe's move in FUTURE_DTYPE, with an fp32 result."""
+    return F.linear(move.to(FUTURE_DTYPE), weight.to(FUTURE_DTYPE)).float()
 
 
 @torch.compile(dynamic=False)
@@ -1513,8 +1520,9 @@ class Cut(Boost):
         self._input_key_errors = None
         self.measured = {}  # Last step's diagnostic credits are not inputs to this estimate.
         self.routed = {}  # chain_credits' routed own-query contexts, reused by the future probes
-        global MOVE_DTYPE  # read by the compiled chain replay
+        global MOVE_DTYPE, FUTURE_DTYPE  # read by the compiled replays
         MOVE_DTYPE = torch.bfloat16 if s.own_query_precision == 'bf16' else torch.float32
+        FUTURE_DTYPE = torch.bfloat16 if s.future_precision == 'bf16' else torch.float32
         d.capture(x, y)
         L = model.config.n_layer
         b, t = x.shape
@@ -1748,8 +1756,8 @@ def signed_hidden_moves(raw, directions, step, weight):
     plus, minus = (raw+step).relu(), (raw-step).relu()
     dp, dm = (plus-base)*(plus+base), (minus-base)*(minus+base)
     odd, even = (dp-dm)*.5, (dp+dm)*.5
-    moved = F.linear(directions*odd[:, None], weight)
-    center = F.linear(even, weight)[:, None]
+    moved = future_linear(directions*odd[:, None], weight)
+    center = future_linear(even, weight)[:, None]
     return torch.cat((center+moved, center-moved), 1)
 
 
@@ -1840,10 +1848,10 @@ def mlp_output_moves(mid, move, hidden, w_fc, w_out):
     anchors K/V. This uses finite forward responses, including ReLU crossings.
     The incoming attention/residual move remains part of the block output.
     """
-    dh = F.linear(norm_delta(mid[:, None], move), w_fc)
+    dh = future_linear(norm_delta(mid[:, None], move), w_fc)
     base = hidden[:, None].relu()
     moved = (hidden[:, None] + dh).relu()
-    return move + F.linear((moved-base)*(moved+base), w_out)
+    return move + future_linear((moved-base)*(moved+base), w_out)
 
 
 compiled_hidden = torch.compile(signed_hidden_moves, dynamic=False)
@@ -1879,7 +1887,7 @@ def stacked_receiver_scores(move, coeffs, x, kraw, wkv, gate, ve, wg, cos, sin, 
     square = x.square().sum(-1)[..., None]  # [J, m, 1]
     inv = torch.rsqrt(square/width+eps)
     moved = torch.rsqrt((square+2*c*(x[:, :, None]*move).sum(-1)+c*c*move.square().sum(-1))/width+eps)
-    proj = torch.einsum('mpw,jow->jmpo', move, wkv)
+    proj = torch.einsum('mpw,jow->jmpo', move.to(FUTURE_DTYPE), wkv.to(FUTURE_DTYPE)).float()
     xproj = torch.einsum('jmw,jow->jmo', x, wkv)[:, :, None]
     dproj = ((c*moved)[..., None]*proj+(moved-inv)[..., None]*xproj).view(J, m, p, 2, heads, hd)
     cc, ss = cos[None, :, None, None], sin[None, :, None, None]
@@ -1912,7 +1920,7 @@ def routed_query_mlp_moves(raw, directions, step, cos, sin, top_keys, top_values
     r0 = rotate(raw.reshape(m, 1, heads, hd), c, s)
     dr = rotate(delta.reshape(m, 2*p, heads, hd), c, s)
     change = routed_output_change(norm_delta(r0, dr), top_keys, top_values, top_p, rest)
-    return mlp_output_moves(mid, F.linear(change.flatten(-2), weight), hidden, w_fc, w_out)
+    return mlp_output_moves(mid, future_linear(change.flatten(-2), weight), hidden, w_fc, w_out)
 
 
 class FiniteFuture:
