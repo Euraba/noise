@@ -453,29 +453,54 @@ def finite_attention_kernels():
     from triton.language.extra.cuda import libdevice
 
     @triton.jit
+    def expm1(x, FAST: tl.constexpr):
+        if FAST:  # exp(x) - 1 loses relative accuracy near 0: a cubic there (|error| < 1e-9 for |x| < 1/64)
+            return tl.where(tl.abs(x) < 0.015625, x * (1 + x * (0.5 + x * (1 / 6))), tl.exp(x) - 1)
+        return libdevice.expm1(x)
+
+    @triton.jit
+    def log1p(x, FAST: tl.constexpr):
+        if FAST:
+            return tl.where(tl.abs(x) < 0.015625, x * (1 - x * (0.5 - x * (1 / 3))), tl.log(1 + x))
+        return libdevice.log1p(x)
+
+    @triton.jit
+    def routed_block(Q, Out, k, v, p, rest, token, head, p0, Probes: tl.constexpr, Heads: tl.constexpr,
+                     D: tl.constexpr, BP: tl.constexpr, FAST: tl.constexpr):
+        features = tl.arange(0, D)
+        probes = p0 + tl.arange(0, BP)
+        q = tl.load(Q + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
+                    probes[:, None] < Probes, 0)
+        # Match both BF16 matmul output roundings of the original implementation.
+        ds = tl.dot(q, tl.trans(k)).to(q.dtype).to(tl.float32) * (D ** -.5)
+        dlse = log1p(tl.sum(p[None, :] * expm1(ds, FAST), 1), FAST)
+        weights = (p[None, :] * expm1(ds - dlse[:, None], FAST)).to(v.dtype)
+        moved = tl.dot(weights, v).to(v.dtype).to(tl.float32)
+        moved += expm1(-dlse, FAST)[:, None] * rest[None, :]
+        tl.store(Out + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
+                 moved, probes[:, None] < Probes)
+
+    @triton.jit
     def routed(Q, K, V, P, Rest, Out,
                Probes: tl.constexpr, Heads: tl.constexpr, Keys: tl.constexpr, D: tl.constexpr,
-               BP: tl.constexpr, BK: tl.constexpr):
-        # One program per (token, head): its routed keys and values load once for every probe.
-        token, head = tl.program_id(0) // Heads, tl.program_id(0) % Heads
+               BP: tl.constexpr, BK: tl.constexpr, LOOP: tl.constexpr, FAST: tl.constexpr):
+        # LOOP: one program per (token, head) loops over its probe blocks; else one per (probe block, token, head)
+        if LOOP:
+            pid = tl.program_id(0)
+        else:
+            pid = tl.program_id(1)
+        token, head = pid // Heads, pid % Heads
         keys, features = tl.arange(0, BK), tl.arange(0, D)
         offsets = ((token * Heads + head) * Keys + keys[:, None]) * D + features[None, :]
         k = tl.load(K + offsets, keys[:, None] < Keys, 0)
         v = tl.load(V + offsets, keys[:, None] < Keys, 0)
         p = tl.load(P + (token * Heads + head) * Keys + keys, keys < Keys, 0)
         rest = tl.load(Rest + (token * Heads + head) * D + features)
-        for p0 in range(0, Probes, BP):
-            probes = p0 + tl.arange(0, BP)
-            q = tl.load(Q + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
-                        probes[:, None] < Probes, 0)
-            # Match both BF16 matmul output roundings of the original implementation.
-            ds = tl.dot(q, tl.trans(k)).to(q.dtype).to(tl.float32) * (D ** -.5)
-            dlse = libdevice.log1p(tl.sum(p[None, :] * libdevice.expm1(ds), 1))
-            weights = (p[None, :] * libdevice.expm1(ds - dlse[:, None])).to(v.dtype)
-            moved = tl.dot(weights, v).to(v.dtype).to(tl.float32)
-            moved += libdevice.expm1(-dlse)[:, None] * rest[None, :]
-            tl.store(Out + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
-                     moved, probes[:, None] < Probes)
+        if LOOP:
+            for p0 in range(0, Probes, BP):
+                routed_block(Q, Out, k, v, p, rest, token, head, p0, Probes, Heads, D, BP, FAST)
+        else:
+            routed_block(Q, Out, k, v, p, rest, token, head, tl.program_id(0) * BP, Probes, Heads, D, BP, FAST)
 
     @triton.jit
     def key_response(Q, DK, A, C, Out,
@@ -510,6 +535,9 @@ def finite_attention_kernels():
     return routed, key_response
 
 
+ROUTED = (False, True, 4)  # routed kernel: probe loop per program, fast expm1/log1p, warps (bench.py's choice)
+
+
 @torch.library.custom_op('noise_record::routed_response', mutates_args=())
 def routed_response(dq: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
                     probabilities: torch.Tensor, rest: torch.Tensor) -> torch.Tensor:
@@ -517,9 +545,10 @@ def routed_response(dq: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
     m, probes, heads, width = dq.shape
     count = keys.shape[2]
     out = torch.empty((m, probes, heads, width), device=dq.device, dtype=torch.float32)
-    finite_attention_kernels()[0][(m * heads,)](
+    loop, fast, warps = ROUTED
+    finite_attention_kernels()[0][(m * heads,) if loop else (triton.cdiv(probes, 32), m * heads)](
         dq.contiguous(), keys.contiguous(), values.contiguous(), probabilities.contiguous(), rest.contiguous(),
-        out, probes, heads, count, width, 32, max(16, triton.next_power_of_2(count)), num_warps=8)
+        out, probes, heads, count, width, 32, max(16, triton.next_power_of_2(count)), loop, fast, num_warps=warps)
     return out
 
 
@@ -1887,7 +1916,7 @@ def stacked_receiver_scores(move, coeffs, x, kraw, wkv, gate, ve, wg, cos, sin, 
     square = x.square().sum(-1)[..., None]  # [J, m, 1]
     inv = torch.rsqrt(square/width+eps)
     moved = torch.rsqrt((square+2*c*(x[:, :, None]*move).sum(-1)+c*c*move.square().sum(-1))/width+eps)
-    proj = torch.einsum('mpw,jow->jmpo', move.to(FUTURE_DTYPE), wkv.to(FUTURE_DTYPE)).float()
+    proj = torch.einsum('mpw,jow->jmpo', move.to(FUTURE_DTYPE), wkv.to(FUTURE_DTYPE))  # read once, in its dtype
     xproj = torch.einsum('jmw,jow->jmo', x, wkv)[:, :, None]
     dproj = ((c*moved)[..., None]*proj+(moved-inv)[..., None]*xproj).view(J, m, p, 2, heads, hd)
     cc, ss = cos[None, :, None, None], sin[None, :, None, None]
