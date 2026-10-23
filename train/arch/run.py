@@ -110,6 +110,7 @@ class Settings:
     future_chunk: int = 512
     future_sigma: float = 0.01  # source-relative RMS; Q includes its own complete MLP response
     future_moments: bool = True  # score future probes with degree-2 moments over the receiving queries
+    future_routed: bool = True  # future Q moves through the chain's routed keys (query_keys), not every key
     query_keys: int = 256   # moving key logits per head; 0 reruns all allowed logits
     key_sigma: float = 0.003
     key_chunk: int = 32
@@ -548,15 +549,20 @@ def query_change_routed(x, delta, pos, w_q, top_keys, top_values, top_p, rest, w
     inv0 = torch.rsqrt(sq / width + EPS)
     inv = torch.rsqrt((sq + 2 * (r0 * dr).sum(-1, keepdim=True) + dr.square().sum(-1, keepdim=True)) / width + EPS)
     dq = dr * inv + r0 * (inv - inv0)
+    return routed_output_change(dq, top_keys, top_values, top_p, rest).flatten(-2) @ w_proj_t
+
+
+def routed_output_change(dq, top_keys, top_values, top_p, rest):
+    """The attention output's finite change [m, P, H, D] when the processed query moves by dq [m, P, H, D] and
+    only its selected key logits move; the held remainder rescales exactly."""
+    width = dq.shape[-1]
     if dq.is_cuda and top_keys.dtype == torch.bfloat16 and width in (32, 64) and top_keys.shape[2] <= 256:
-        dout = routed_response(dq.to(top_keys.dtype), top_keys, top_values, top_p, rest)
-        return dout.flatten(-2) @ w_proj_t
+        return routed_response(dq.to(top_keys.dtype), top_keys, top_values, top_p, rest)
     ds = torch.einsum('mphd,mhkd->mphk', dq.to(top_keys.dtype), top_keys).float() * width ** -0.5
     p = top_p.unsqueeze(1)
     dlse = torch.log1p((p * torch.expm1(ds)).sum(-1, keepdim=True))
     dout = torch.einsum('mphk,mhkd->mphd', (p * torch.expm1(ds - dlse)).to(top_values.dtype), top_values).float()
-    dout = dout + torch.expm1(-dlse) * rest.unsqueeze(1)
-    return dout.flatten(-2) @ w_proj_t
+    return dout + torch.expm1(-dlse) * rest.unsqueeze(1)
 
 
 def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc, w_out_t, weight_t, base,
@@ -1370,6 +1376,8 @@ class Cut(Boost):
                 own = self.own_query_inputs(start // length)
                 if s.query_keys:
                     own = self.strong_keys(own, s.query_keys)
+                    if s.future_routed:
+                        self.routed[start // length] = own
             for t0 in range(start, start + length, m):
                 t1 = min(t0 + m, start + length)
                 sl = slice(t0, t1)
@@ -1494,6 +1502,7 @@ class Cut(Boost):
         self.maps.clear()
         self._input_key_errors = None
         self.measured = {}  # Last step's diagnostic credits are not inputs to this estimate.
+        self.routed = {}  # chain_credits' routed own-query contexts, reused by the future probes
         d.capture(x, y)
         L = model.config.n_layer
         b, t = x.shape
@@ -1850,11 +1859,27 @@ def query_mlp_moves(raw, directions, step, cos, sin, keys, values, probabilities
     return mlp_output_moves(mid, move, hidden, w_fc, w_out)
 
 
+@torch.compile(dynamic=False)
+def routed_query_mlp_moves(raw, directions, step, cos, sin, top_keys, top_values, top_p, rest, weight,
+                           mid, hidden, w_fc, w_out):
+    """query_mlp_moves with the chain's routed own-query response (its query_keys strongest keys per head move,
+    the rest rescale exactly) in place of every key."""
+    m, p, width = directions.shape
+    heads, hd = top_keys.shape[1], top_keys.shape[-1]
+    delta = torch.cat((step[:, None]*directions, -step[:, None]*directions), 1)
+    c, s = cos[:, None, None], sin[:, None, None]
+    r0 = rotate(raw.reshape(m, 1, heads, hd), c, s)
+    dr = rotate(delta.reshape(m, 2*p, heads, hd), c, s)
+    change = routed_output_change(norm_delta(r0, dr), top_keys, top_values, top_p, rest)
+    return mlp_output_moves(mid, F.linear(change.flatten(-2), weight), hidden, w_fc, w_out)
+
+
 class FiniteFuture:
     def __init__(self, estimator, source_layers=4, tokens=64, chunk=512, sigma=.01, seed=9181,
                  query_mlp=True, timing=True, moments=False):
         self.e = estimator
         self.moments = moments
+        self.routed = None  # the chain's routed own-query context of this sequence, when set
         self.source_layers, self.tokens, self.chunk = source_layers, tokens, chunk
         self.sigma, self.seed = sigma, seed
         self.query_mlp = query_mlp
@@ -1920,6 +1945,15 @@ class FiniteFuture:
                                weight=model.transformer.h[layer].mlp.c_proj.weight.float())
         elif family == "wte":
             response = partial(compiled_embedding, raw[sl])
+        elif self.routed is not None and self.query_mlp:
+            ctx = self.contexts[layer]
+            _, _, _, _, top_keys, top_values, top_p, rests, _, _ = self.routed
+            mid, hidden, w_fc, w_out = ctx["source_mlp"]
+            response = partial(routed_query_mlp_moves, raw[sl], cos=self.cos[sl], sin=self.sin[sl],
+                               top_keys=top_keys[layer][sl], top_values=top_values[layer][sl],
+                               top_p=top_p[layer][sl], rest=rests[layer][sl],
+                               weight=model.transformer.h[layer].attn.c_proj.weight.float(),
+                               mid=mid[sl], hidden=hidden[sl], w_fc=w_fc, w_out=w_out)
         else:
             ctx = self.contexts[layer]
             kwargs = dict(cos=self.cos[sl], sin=self.sin[sl], keys=ctx["k"], values=ctx["values"],
@@ -2041,6 +2075,7 @@ def add_future_gradients(estimator, gradients):
                           query_mlp=True, timing=False, moments=s.future_moments)
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
+        future.routed = getattr(e, 'routed', {}).get(sequence)
         future.prepare(sequence)
         corrections = future.estimate((s.future_draws,))[s.future_draws]
         for site, credit in corrections.items():
