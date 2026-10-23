@@ -49,7 +49,7 @@ class GPTConfig:
     n_embd: int = 512
     # Per block, repeating: S = half-sequence window, L = full. The last block is always L.
     window_pattern: str = 'SSSL'
-    feedback: bool = True  # the full-bandwidth second pass
+    feedback: bool = False  # the full-bandwidth second pass (backprop ruler: no gain on top of the n-grams)
     # n-gram memory: n = 2..ngram_max, each hashed into ngram_heads tables of about ngram_rows rows (Engram's
     # 5x the vocabulary); ngram_max < 2 turns it off.
     ngram_max: int = 3
