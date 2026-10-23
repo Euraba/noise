@@ -111,6 +111,7 @@ class Settings:
     future_sigma: float = 0.01  # source-relative RMS; Q includes its own complete MLP response
     future_moments: bool = True  # score future probes with degree-2 moments over the receiving queries
     future_routed: bool = True  # future Q moves through the chain's routed keys (query_keys), not every key
+    future_stacked: bool = True  # score every receiver of a source chunk at once (with future_moments)
     query_keys: int = 256   # moving key logits per head; 0 reruns all allowed logits
     key_sigma: float = 0.003
     key_chunk: int = 32
@@ -1862,6 +1863,35 @@ def receiver_moment_scores(move, coefficient, x, kraw, gate, ve, wkv, wg, cos, s
 
 
 @torch.compile(dynamic=False)
+def stacked_receiver_scores(move, coeffs, x, kraw, wkv, gate, ve, wg, cos, sin, mk, mv, mkk, mkv):
+    """receiver_moment_scores summed over every receiver of one source chunk, with one projection of the move for
+    all of them: norm_delta(x_j, c_j move) = c_j inv'_j move + (inv'_j - inv_j) x_j, so its K/V products are
+    c_j inv'_j (move W_kv,j) + (inv'_j - inv_j) (x_j W_kv,j). Stacked per receiver j: coeffs [J], x [J, m, W],
+    kraw [J, m, H, hd], wkv [J, 2W, W], gate [J, m, H], ve [J, m, H, hd], wg [J, H, G] (zeros for blocks without
+    value embeddings, whose gate change is then zero), moments [J, H, m, ...]. Returns [m, P]."""
+    J, m, width = x.shape
+    p = move.shape[1]
+    heads, hd = kraw.shape[-2:]
+    eps = torch.finfo(x.dtype).eps
+    c = coeffs[:, None, None]
+    square = x.square().sum(-1)[..., None]  # [J, m, 1]
+    inv = torch.rsqrt(square/width+eps)
+    moved = torch.rsqrt((square+2*c*torch.einsum('jmw,mpw->jmp', x, move)+c*c*move.square().sum(-1))/width+eps)
+    proj = torch.einsum('mpw,jow->jmpo', move, wkv)
+    xproj = torch.einsum('jmw,jow->jmo', x, wkv)[:, :, None]
+    dproj = ((c*moved)[..., None]*proj+(moved-inv)[..., None]*xproj).view(J, m, p, 2, heads, hd)
+    cc, ss = cos[None, :, None, None], sin[None, :, None, None]
+    dk = norm_delta(rotate(kraw[:, :, None], cc, ss), rotate(dproj[:, :, :, 0], cc, ss))  # [J, m, P, H, hd]
+    g = wg.shape[-1]
+    dn = (c*moved)[..., None]*move[None, ..., :g]+(moved-inv)[..., None]*x[:, :, None, :g]
+    dg = torch.einsum('jmpg,jhg->jmph', dn, wg)
+    dv = dproj[:, :, :, 1]+(2*((gate[:, :, None]+dg).sigmoid()-gate[:, :, None].sigmoid()))[..., None]*ve[:, :, None]
+    quadratic = (torch.einsum('jmphd,jhmde->jmphe', dk, mkk)*dk+torch.einsum('jmphd,jhmde->jmphe', dk, mkv)*dv)
+    linear = dk*mk.transpose(1, 2)[:, :, None]+dv*mv.transpose(1, 2)[:, :, None]
+    return (quadratic+linear).sum((0, 3, 4))
+
+
+@torch.compile(dynamic=False)
 def query_mlp_moves(raw, directions, step, cos, sin, keys, values, probabilities, weight,
                     base, mid, hidden, w_fc, w_out):
     move = streamed_query_moves(raw, directions, step, cos, sin, keys, values, probabilities, weight, base)
@@ -1885,9 +1915,9 @@ def routed_query_mlp_moves(raw, directions, step, cos, sin, top_keys, top_values
 
 class FiniteFuture:
     def __init__(self, estimator, source_layers=4, tokens=64, chunk=512, sigma=.01, seed=9181,
-                 query_mlp=True, timing=True, moments=False):
+                 query_mlp=True, timing=True, moments=False, stacked=False):
         self.e = estimator
-        self.moments = moments
+        self.moments, self.stacked = moments, stacked
         self.routed = None  # the chain's routed own-query context of this sequence, when set
         self.source_layers, self.tokens, self.chunk = source_layers, tokens, chunk
         self.sigma, self.seed = sigma, seed
@@ -1972,6 +2002,8 @@ class FiniteFuture:
                 mid, hidden, w_fc, w_out = ctx["source_mlp"]
                 kwargs.update(mid=mid[sl], hidden=hidden[sl], w_fc=w_fc, w_out=w_out)
             response = partial(query_mlp_moves if self.query_mlp else compiled_query, raw[sl], **kwargs)
+        if self.stacked and receivers and all("moments" in self.contexts[j] for j, _ in receivers):
+            return LocalExperiment(response, self.stacked_scorer(receivers, sl))
         scorers = []
         for j, coefficient in receivers:
             ctx = self.contexts[j]
@@ -1995,6 +2027,22 @@ class FiniteFuture:
                 total = total + receiver(move)
             return total
         return LocalExperiment(response, score)
+
+    def stacked_scorer(self, receivers, sl):
+        """stacked_receiver_scores bound to these receivers' clean tensors at tokens sl."""
+        ctxs = [self.contexts[j] for j, _ in receivers]
+        x = torch.stack([c["x"][sl] for c in ctxs])
+        kraw = torch.stack([c["kraw"][sl] for c in ctxs])
+        heads, g = kraw.shape[-2], self.e.model.transformer.h[0].attn.ve_gate_channels
+        some = lambda name, shape: torch.stack([c[name][sl] if c[name] is not None else
+                                                x.new_zeros(shape) for c in ctxs])
+        wg = torch.stack([c["wg"] if c["wg"] is not None else x.new_zeros(heads, g) for c in ctxs])
+        moments = [torch.stack([c["moments"][k][:, sl] for c in ctxs]) for k in range(4)]
+        return partial(stacked_receiver_scores, coeffs=torch.stack([coefficient for _, coefficient in receivers]),
+                       x=x, kraw=kraw, wkv=torch.stack([c["wkv"] for c in ctxs]),
+                       gate=some("gate", (x.shape[1], heads)), ve=some("ve", kraw.shape[1:]), wg=wg,
+                       cos=self.cos[sl], sin=self.sin[sl], mk=moments[0], mv=moments[1], mkk=moments[2],
+                       mkv=moments[3])
 
     @torch.no_grad()
     def estimate(self, budgets=(512,), families=("hidden", "query", "wte")):
@@ -2081,7 +2129,8 @@ def add_future_gradients(estimator, gradients):
                              generator=d.shared_generator if e.split > 1 else d.generator).item())
     future = FiniteFuture(e, source_layers=s.future_layers, tokens=s.future_tokens,
                           chunk=s.future_chunk, sigma=s.future_sigma, seed=seed,
-                          query_mlp=True, timing=False, moments=s.future_moments)
+                          query_mlp=True, timing=False, moments=s.future_moments,
+                          stacked=s.future_stacked)
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
         future.routed = getattr(e, 'routed', {}).get(sequence)
