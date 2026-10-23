@@ -746,12 +746,11 @@ class Capture:
                 self.clean_loss = self.model(x, y, loss_reduction='none').view_as(y).float()
         finally:
             self.capturing = False
-        if 'feedback' in self.outputs:
-            # Track 3: the hooks kept the second pass, whose embedding is wte + feedback(h[t-1]); every
-            # embedding probe moves that sum, and h[t-1] (the first pass) is a fixed input, like the token
-            self.outputs['transformer.wte'] = self.outputs['transformer.wte'] + self.outputs['feedback'].to(
-                self.outputs['transformer.wte'].dtype)
         with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == 'cuda'):
+            # Track 3: the hooks kept the second pass, whose embedding is wte + n-grams + feedback(h[t-1]),
+            # recomputed as the forward did; every embedding probe moves that sum, and h[t-1] (the first
+            # pass) is a fixed input, like the token
+            self.outputs['transformer.wte'] = self.model.embed(x, self.inputs['feedback'])
             self.x0 = norm(self.outputs['transformer.wte'])
 
     def head_error(self, sigma=0.1):
@@ -767,12 +766,25 @@ class Capture:
             return weight_error.index_add_(0, x.reshape(-1), error.reshape(-1, error.shape[-1]))
         return torch.einsum('btd,bti->di', error, x)
 
-    def embedding_gradients(self, gradients, credit):
-        """wte's gradient from the credit at the embedding output, and feedback's from the same credit: the
-        feedback enters by addition there, so its credit takes no extra step."""
-        gradients['transformer.wte.weight'] = self.reassemble('transformer.wte', credit)
-        if 'feedback' in self.inputs:
-            gradients['feedback.weight'] = self.reassemble('feedback', credit)
+    def embedding_gradients(self, gradients, credit, sequence=None):
+        """Add the gradients of everything summed into the embedding, from the credit there ([batch, token,
+        width], or sequence `sequence`'s [token, width]): token and n-gram rows index it, feedback multiplies it
+        by h[t-1]. None of them takes a step through a nonlinearity."""
+        def inputs(site):
+            return self.inputs[site] if sequence is None else self.inputs[site][sequence]
+
+        def grad(site):
+            if site + '.weight' not in gradients:
+                gradients[site + '.weight'] = torch.zeros_like(self.modules[site].weight, dtype=torch.float32)
+            return gradients[site + '.weight']
+
+        credit = credit.reshape(-1, credit.shape[-1]).float()
+        grad('transformer.wte').index_add_(0, inputs('transformer.wte').reshape(-1), credit)
+        if 'ngram.table' in self.inputs:  # each order's heads hold the width side by side
+            ids = inputs('ngram.table').reshape(credit.shape[0], -1)
+            error = credit.unsqueeze(1).expand(-1, self.model.ngram.orders, -1)
+            grad('ngram.table').index_add_(0, ids.reshape(-1), error.reshape(ids.numel(), -1))
+        grad('feedback').addmm_(credit.T, inputs('feedback').reshape(credit.shape[0], -1))
 
 class Boost:
     """Phase 1: stagewise credit, each sub-block against the shared head reading the stream right after it."""
@@ -1519,7 +1531,8 @@ class Cut(Boost):
             # internals split or average their own: keys share dims, queries share draws, hidden units share units)
             for name in list(gradients):
                 if name == 'lm_head.weight' or name.endswith('c_proj.weight') or name in (
-                        'transformer.wte.weight', 'feedback.weight', 'resid_lambdas', 'x0_lambdas'):
+                        'transformer.wte.weight', 'feedback.weight', 'ngram.table.weight', 'resid_lambdas',
+                        'x0_lambdas'):
                     gradients[name] = torch.zeros_like(gradients[name])
         if s.future_draws:
             # Use this capture's original measured hub targets, never corrected
@@ -1973,10 +1986,7 @@ def add_future_gradients(estimator, gradients):
                 # response; remove their partial-cycle decoding cross-talk.
                 credit = credit * (raw+step > 0)[None]
             if site == 'transformer.wte':
-                gradient.index_add_(0, inputs.flatten(), credit[0].flatten(0, -2))
-                if 'feedback' in d.inputs:
-                    gradients['feedback.weight'].addmm_(credit[0].flatten(0, -2).T,
-                                                        d.inputs['feedback'][sequence].flatten(0, -2))
+                d.embedding_gradients(gradients, credit[0], sequence)
             else:
                 gradient.addmm_(credit[0].T, inputs)
         future.contexts = None
@@ -2205,7 +2215,7 @@ def make_optimizer(model, recipe, steps):
         if name.startswith('transformer.h.') and parameter.ndim == 2 and 've_gate' not in name:
             matrices.append(parameter)
             continue
-        scale = 300 if ('wte' in name or 'value_embeds' in name) else 30 if 'lambdas' in name else 1
+        scale = 300 if ('wte' in name or 'value_embeds' in name or 'ngram' in name) else 30 if 'lambdas' in name else 1
         groups.setdefault(scale, []).append(parameter)
     adam = torch.optim.AdamW(
         [{'params': ps, 'lr': recipe.lr * scale} for scale, ps in groups.items()],

@@ -1,12 +1,18 @@
-"""Track 3's model: the 37.7M-parameter GPT of the Dust paper (8 blocks, width 512) with full-bandwidth feedback.
+"""Track 3's model: the 37.7M-parameter GPT of the Dust paper (8 blocks, width 512) with full-bandwidth feedback
+and an n-gram memory.
 
 Feedback follows Wang et al., "Full-bandwidth transformer" (arXiv 2608.08888), in the additive form of their
 App. O.1: a first pass runs the plain model, then a second pass adds feedback(h[t-1]) to position t's token
 embedding, h being the first pass's normalized top state. feedback starts at zero, so training starts from the
-plain model. eval.py scores this module with --model train/arch/model.py.
+plain model.
+
+The n-gram memory follows DeepSeek's Engram ("Conditional Memory via Scalable Lookup"), without its gate and
+convolution: hashed rows for the last 2 and 3 tokens, added to the token embedding. It also starts at zero.
+eval.py scores this module with --model train/arch/model.py.
 """
 from dataclasses import dataclass
 from functools import cache
+import random
 
 import torch
 from torch import nn
@@ -43,6 +49,11 @@ class GPTConfig:
     n_embd: int = 512
     # Per block, repeating: S = half-sequence window, L = full. The last block is always L.
     window_pattern: str = 'SSSL'
+    # n-gram memory: n = 2..ngram_max, each hashed into ngram_heads tables of about ngram_rows rows (Engram's
+    # 5x the vocabulary); ngram_max < 2 turns it off.
+    ngram_max: int = 3
+    ngram_heads: int = 8
+    ngram_rows: int = 5 * 4096
 
 
 def norm(x):
@@ -52,6 +63,47 @@ def norm(x):
 def has_ve(layer_idx, n_layer):
     """Value embeddings on every other block, counting back from the last."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def next_prime(n):
+    n += 1
+    while any(n % p == 0 for p in range(2, int(n ** 0.5) + 1)):
+        n += 1
+    return n
+
+
+class NgramMemory(nn.Module):
+    """Hashed n-gram embeddings. For each n, every head hashes the last n tokens (XOR of token times an odd
+    multiplier, mod its own prime) into its own table rows of width n_embd / heads; a position's memory is the
+    sum over n of its heads' rows side by side. The hash is fixed, so the rows are a plain lookup table."""
+
+    def __init__(self, config, seed=0):
+        super().__init__()
+        self.orders, self.heads = config.ngram_max - 1, config.ngram_heads
+        self.pad = config.vocab_size  # stands for the tokens before the sequence start
+        rng = random.Random(seed)
+        self.multipliers = [2 * rng.randrange(2 ** 30) + 1 for _ in range(config.ngram_max)]
+        self.primes, self.offsets, p, rows = [], [], config.ngram_rows, 0
+        for _ in range(self.orders * self.heads):
+            p = next_prime(p)
+            self.primes.append(p)
+            self.offsets.append(rows)
+            rows += p
+        self.table = nn.Embedding(rows, config.n_embd // self.heads)
+
+    def ids(self, idx):
+        """Table rows of each position, [batch, token, orders * heads], n = 2 first."""
+        mix, out = idx * self.multipliers[0], []
+        for k in range(1, self.orders + 1):
+            mix = mix ^ (F.pad(idx[:, :-k], (k, 0), value=self.pad) * self.multipliers[k])
+            for h in range(self.heads):
+                j = (k - 1) * self.heads + h
+                out.append(torch.remainder(mix, self.primes[j]) + self.offsets[j])
+        return torch.stack(out, -1)
+
+    def forward(self, idx):
+        B, T = idx.shape
+        return self.table(self.ids(idx)).view(B, T, self.orders, -1).sum(2)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -134,6 +186,7 @@ class GPT(nn.Module):
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)  # untied from the embedding
         self.feedback = nn.Linear(config.n_embd, config.n_embd, bias=False)  # h[t-1] into position t's embedding
+        self.ngram = NgramMemory(config) if config.ngram_max >= 2 else None
         # The stream entering block i is resid_lambdas[i] * x + x0_lambdas[i] * x0, a learned mix of the
         # previous block's output and the normalized token embedding.
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -154,6 +207,8 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         torch.nn.init.zeros_(self.feedback.weight)
+        if self.ngram is not None:
+            torch.nn.init.zeros_(self.ngram.table.weight)
         s = 3 ** 0.5 * self.config.n_embd ** (-0.5)
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -175,6 +230,8 @@ class GPT(nn.Module):
         # Token and value embeddings are stored in bfloat16 on the GPU
         if self.transformer.wte.weight.device.type == 'cuda':
             self.transformer.wte.to(dtype=torch.bfloat16)
+            if self.ngram is not None:
+                self.ngram.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
 
@@ -204,13 +261,19 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i])
         return norm(x)
 
+    def embed(self, idx, previous=None):
+        """The token embedding plus the n-gram memory, and on the second pass the feedback of h[t-1]."""
+        e = self.transformer.wte(idx)
+        if self.ngram is not None:
+            e = e + self.ngram(idx).to(e.dtype)
+        return e if previous is None else e + self.feedback(previous).to(e.dtype)
+
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
-        e = self.transformer.wte(idx)
-        h = self.stack(e, idx, cos_sin)
+        h = self.stack(self.embed(idx), idx, cos_sin)
         previous = F.pad(h[:, :-1], (0, 0, 1, 0))  # position 0 has no previous token
-        x = self.stack(e + self.feedback(previous).to(e.dtype), idx, cos_sin)
+        x = self.stack(self.embed(idx, previous), idx, cos_sin)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # soft cap
         if targets is not None:
