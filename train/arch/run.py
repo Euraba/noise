@@ -517,7 +517,7 @@ def routed_response(dq: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
     out = torch.empty((m, probes, heads, width), device=dq.device, dtype=torch.float32)
     finite_attention_kernels()[0][(m * heads,)](
         dq.contiguous(), keys.contiguous(), values.contiguous(), probabilities.contiguous(), rest.contiguous(),
-        out, probes, heads, count, width, 32, max(16, triton.next_power_of_2(count)), num_warps=4)
+        out, probes, heads, count, width, 32, max(16, triton.next_power_of_2(count)), num_warps=8)
     return out
 
 
