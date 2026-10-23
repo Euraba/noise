@@ -117,8 +117,10 @@ class Settings:
     key_chunk: int = 32
     key_moments: bool = True  # score input-K probes with degree-2 moments over the receiving queries
     key_fused: bool = True  # form the input-K changes and their moment scores in one kernel (with key_moments)
+    raw_key_moments: bool = True  # Cut's raw-K single-coordinate experiments scored by the same moments too
     own_query_precision: str = 'bf16'  # the chain's own-query move products (the record: 'fp32', TF32 products)
     future_precision: str = 'bf16'  # the future probes' move products (the record: 'fp32', TF32 products)
+    moment_precision: str = 'bf16'  # the quadratic moments' products ('fp32': TF32 products)
     ngram_lr_scale: float = 300  # the n-gram tables' Adam rate, in units of lr (the token embedding's is 300)
 
     def __post_init__(self):
@@ -664,6 +666,13 @@ chain_chunk_own = torch.compile(chain_chunk_eager, dynamic=True)
 KEY_BUCKET = 256
 MOVE_DTYPE = torch.bfloat16  # the own-query move products of the chain replay (Settings.own_query_precision)
 FUTURE_DTYPE = torch.bfloat16  # the future probes' move products (Settings.future_precision)
+MOMENT_DTYPE = torch.bfloat16  # the products forming the quadratic moments (Settings.moment_precision)
+
+
+def moment_product(weights, outer):
+    """weights [H, T(query), T(source)] transposed times outer [H, T(query), F], in MOMENT_DTYPE with an fp32
+    result: the quadratic moments' sums over each source's receiving queries."""
+    return torch.bmm(weights.transpose(1, 2).to(MOMENT_DTYPE), outer.to(MOMENT_DTYPE)).float()
 
 
 def future_linear(move, weight):
@@ -747,7 +756,7 @@ def key_moments(qp, A, C):
     ac = A*C
     mk = torch.einsum('hst,hsd->htd', ac, qp)*dh**-.5
     qq = (qp[..., :, None]*qp[..., None, :]).flatten(-2)
-    mkk = torch.bmm((ac*(.5-A)).transpose(1, 2), qq).view(*mk.shape, dh)/dh
+    mkk = moment_product(ac*(.5-A), qq).view(*mk.shape, dh)/dh
     return mk, mkk
 
 
@@ -1066,8 +1075,9 @@ class Boost:
             errors[prefix + 'c_k'] = credit_all.permute(0, 2, 1, 3).reshape(b, t, h * hd)
         return errors
 
-    def key_errors_from_context(self, layer, context):
-        """Raw-K finite experiments, sharing the input-K context and skipping masked query blocks."""
+    def key_errors_from_context(self, layer, context, moments=None):
+        """Raw-K finite experiments, sharing the input-K context and skipping masked query blocks; with key
+        moments (mk, mkk) of the context, scored by them as the input-K probes are."""
         qp, kp, raw, cos, sin, A, C = context
         h, t, hd = raw.shape
         lo, hi = self.share(hd)
@@ -1078,6 +1088,12 @@ class Boost:
             t1 = min(t0 + KEY_BUCKET, t)
             q1 = min(t, t1 + self.model.window_sizes[layer][0])
             source, query = slice(t0, t1), slice(t0, q1)
+            if moments is not None:
+                moves = raw_key_moves(kp[:, source], raw[:, source], steps[:, source], cos[source], sin[source],
+                                      eye[lo:hi])
+                scored = key_moment_scores(moves, moments[0][:, source], moments[1][:, source])
+                result[:, source, lo:hi] = scored.transpose(1, 2) / steps[:, source]
+                continue
             if raw.is_cuda and hd in (32, 64):
                 moves = raw_key_moves(kp[:, source], raw[:, source], steps[:, source],
                                       cos[source], sin[source], eye[lo:hi])
@@ -1296,8 +1312,9 @@ class Cut(Boost):
             for r in range(d.batch):
                 context = self.key_context(i, r, target)
                 qp, _, raw, cos, sin, A, C = context
-                raw_credit[r] = self.key_errors_from_context(i, context).transpose(0, 1).reshape(d.length, self.width)
                 moments = key_moments(qp, A, C) if s.key_moments and self.device.type == 'cuda' else None
+                raw_credit[r] = self.key_errors_from_context(
+                    i, context, moments if s.raw_key_moments else None).transpose(0, 1).reshape(d.length, self.width)
                 xin = d.blocks[i][r].float()
                 projected_x = xin @ w_key.T
                 steps = s.key_path_sigma * xin.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
@@ -1562,9 +1579,10 @@ class Cut(Boost):
         self._input_key_errors = None
         self.measured = {}  # Last step's diagnostic credits are not inputs to this estimate.
         self.routed = {}  # chain_credits' routed own-query contexts, reused by the future probes
-        global MOVE_DTYPE, FUTURE_DTYPE  # read by the compiled replays
+        global MOVE_DTYPE, FUTURE_DTYPE, MOMENT_DTYPE  # read by the compiled replays and the moments
         MOVE_DTYPE = torch.bfloat16 if s.own_query_precision == 'bf16' else torch.float32
         FUTURE_DTYPE = torch.bfloat16 if s.future_precision == 'bf16' else torch.float32
+        MOMENT_DTYPE = torch.bfloat16 if s.moment_precision == 'bf16' else torch.float32
         d.capture(x, y)
         L = model.config.n_layer
         b, t = x.shape
@@ -1777,8 +1795,8 @@ def future_moments(q, target, a, contrast, window):
     mv = torch.einsum('hst,hsd->htd', a, target)
     qq = (q[..., :, None]*q[..., None, :]).flatten(-2)
     qg = (q[..., :, None]*target[..., None, :]).flatten(-2)
-    mkk = torch.bmm((ac*(.5-a)).transpose(1, 2), qq).view(h, t, dh, dh)/dh
-    mkv = torch.bmm((a-a*a).transpose(1, 2), qg).view(h, t, dh, dh)*dh**-.5
+    mkk = moment_product(ac*(.5-a), qq).view(h, t, dh, dh)/dh
+    mkv = moment_product(a-a*a, qg).view(h, t, dh, dh)*dh**-.5
     return mk, mv, mkk, mkv
 
 
@@ -1952,9 +1970,10 @@ def receiver_moment_kernel():
     def kernel(Proj, XProj, A, B, Kraw, Cos, Sin, Gate, Ve, Mk, Mv, Mkk, Mkv, Out,
                M: tl.constexpr, P: tl.constexpr, H: tl.constexpr, D: tl.constexpr, BP: tl.constexpr,
                EPS: tl.constexpr, PJ: tl.constexpr, PT: tl.constexpr, PPROBE: tl.constexpr, XROW: tl.constexpr,
-               VALUES: tl.constexpr):
+               VALUES: tl.constexpr, VJ, VH, QJ, QH):
         # Proj strides PJ, PT, PPROBE per receiver, token and probe (PT 0: every token shares the probes'
-        # products); VALUES False: keys alone (no V, gate or V moments)
+        # products); VALUES False: keys alone (no V, gate or V moments). Moments are strided views: VJ, VH (QJ, QH)
+        # the receiver and head strides of the vectors (matrices), tokens D (D * D) apart.
         token, jh = tl.program_id(0), tl.program_id(1)
         j, head = jh // H, jh % H
         row = j * M + token  # (receiver, token)
@@ -1968,14 +1987,15 @@ def receiver_moment_kernel():
         inv0 = tl.rsqrt(square / D + EPS)
         xproj = XProj + row * XROW + head * D
         xk, xk_partner = tl.load(xproj + d), tl.load(xproj + partner)
-        moment = (jh * M + token) * D
-        mk = tl.load(Mk + moment + d)
-        mkk = tl.load(Mkk + (moment + d[:, None]) * D + d[None, :])
+        vector = j * VJ + head * VH + token * D
+        matrix = j * QJ + head * QH + token * D * D + d[:, None] * D + d[None, :]
+        mk = tl.load(Mk + vector + d)
+        mkk = tl.load(Mkk + matrix)
         if VALUES:
             xv = tl.load(xproj + H * D + d)
             ve = tl.load(Ve + (row * H + head) * D + d)
-            mv = tl.load(Mv + moment + d)
-            mkv = tl.load(Mkv + (moment + d[:, None]) * D + d[None, :])
+            mv = tl.load(Mv + vector + d)
+            mkv = tl.load(Mkv + matrix)
         for p0 in range(0, P, BP):
             probe = p0 + tl.arange(0, BP)
             valid = probe < P
@@ -2008,16 +2028,23 @@ def receiver_moments(proj: torch.Tensor, xproj: torch.Tensor, a: torch.Tensor, b
     """Moment scores [J H, m, P] of each receiver j and head: its input change a proj + b xproj (proj [m, P, J, 2W]
     the move's K/V products, contiguous as one matmul leaves them; xproj [J, m, 2W] the clean ones, a and b
     [J, m, P]) through RoPE and QK-norm to dk, plus the VE gate change gate [J, m, P, H] times ve to dv; moments
-    as in stacked_receiver_scores."""
+    as in stacked_receiver_scores ([J, H, m, ...] views, tokens contiguous)."""
     m, P, J, width = proj.shape
     heads, hd = kraw.shape[-2:]
     assert proj.is_contiguous()  # a copy would cost more than the kernel
+    assert mk.stride() == mv.stride() and mkk.stride() == mkv.stride() and moment_layout(mk, mkk, hd)
     out = torch.empty((J * heads, m, P), device=proj.device, dtype=torch.float32)
     block, warps = RECEIVERS
     receiver_moment_kernel()[(m, J * heads)](
-        proj, *(t.contiguous() for t in (xproj, a, b, kraw, cos, sin, gate, ve, mk, mv, mkk, mkv)), out,
-        m, P, heads, hd, block, EPS, width, P * J * width, J * width, width, True, num_warps=warps)
+        proj, *(t.contiguous() for t in (xproj, a, b, kraw, cos, sin, gate, ve)), mk, mv, mkk, mkv, out,
+        m, P, heads, hd, block, EPS, width, P * J * width, J * width, width, True,
+        mk.stride(0), mk.stride(1), mkk.stride(0), mkk.stride(1), num_warps=warps)
     return out
+
+
+def moment_layout(mk, mkk, hd):
+    """The token and feature strides receiver_moment_kernel assumes for moment views."""
+    return mk.stride()[-2:] == (hd, 1) and mkk.stride()[-3:] == (hd * hd, hd, 1)
 
 
 @receiver_moments.register_fake
@@ -2034,11 +2061,12 @@ def key_input_moments(proj: torch.Tensor, xproj: torch.Tensor, a: torch.Tensor, 
     heads, hd = kraw.shape[-2:]
     out = torch.empty((heads, m, P), device=proj.device, dtype=torch.float32)
     block, warps = RECEIVERS
-    mk, mkk = mk.contiguous(), mkk.contiguous()
+    assert moment_layout(mk, mkk, hd)
     receiver_moment_kernel()[(m, heads)](
         proj.contiguous(), xproj.contiguous(), a.contiguous(), b.contiguous(), kraw.contiguous(), cos.contiguous(),
         sin.contiguous(), mk, mk, mk, mk, mkk, mkk, out,
-        m, P, heads, hd, block, EPS, 0, 0, heads * hd, heads * hd, False, num_warps=warps)
+        m, P, heads, hd, block, EPS, 0, 0, heads * hd, heads * hd, False,
+        0, mk.stride(0), 0, mkk.stride(0), num_warps=warps)
     return out
 
 
@@ -2157,6 +2185,10 @@ class FiniteFuture:
                     d.blocks[i][sequence].float()+d.outputs[prefix+"c_proj"][sequence].float(),
                     d.outputs[f"transformer.h.{i}.mlp.c_fc"][sequence].float(),
                     block.mlp.c_fc.weight.float(), block.mlp.c_proj.weight.float())
+        if self.moments:  # one [L, H, T, ...] buffer per kind: the stacked scorer reads receiver ranges as views
+            self.stacked_moments = [torch.stack([c["moments"][k] for c in contexts]) for k in range(4)]
+            for i, c in enumerate(contexts):
+                c["moments"] = tuple(m[i] for m in self.stacked_moments)
         self.contexts, self.sequence = contexts, sequence
         self.cos, self.sin = cos[0, :, 0], sin[0, :, 0]
         return self
@@ -2231,7 +2263,9 @@ class FiniteFuture:
         some = lambda name, shape: torch.stack([c[name][sl] if c[name] is not None else
                                                 x.new_zeros(shape) for c in ctxs])
         wg = torch.stack([c["wg"] if c["wg"] is not None else x.new_zeros(heads, g) for c in ctxs])
-        moments = [torch.stack([c["moments"][k][:, sl] for c in ctxs]) for k in range(4)]
+        first, last = receivers[0][0], receivers[-1][0]
+        assert [j for j, _ in receivers] == list(range(first, last + 1))
+        moments = [m[first:last + 1, :, sl] for m in self.stacked_moments]
         scores = fused_receiver_scores if self.fused and x.is_cuda else stacked_receiver_scores
         return partial(scores, coeffs=torch.stack([coefficient for _, coefficient in receivers]),
                        x=x, kraw=kraw, wkv=torch.stack([c["wkv"] for c in ctxs]),
@@ -2344,7 +2378,7 @@ def add_future_gradients(estimator, gradients):
                 d.embedding_gradients(gradients, credit[0], sequence)
             else:
                 gradient.addmm_(credit[0].T, inputs)
-        future.contexts = None
+        future.contexts = future.stacked_moments = None
         del corrections
 
 
