@@ -115,6 +115,7 @@ class Settings:
     key_sigma: float = 0.003
     key_chunk: int = 32
     key_moments: bool = True  # score input-K probes with degree-2 moments over the receiving queries
+    own_query_precision: str = 'bf16'  # the chain's own-query move products (the record: 'fp32', TF32 products)
 
     def __post_init__(self):
         width, hidden = self.model.n_embd, 4 * self.model.n_embd
@@ -422,7 +423,7 @@ def query_change(x, delta, pos, rel, w_q, keys, values, w_proj_t, cos, sin, wind
     rotate = lambda u: torch.cat([u[..., :width // 2] * c + u[..., width // 2:] * s,
                                   u[..., :width // 2] * -s + u[..., width // 2:] * c], -1)
     r0 = rotate((norm(x) @ w_q.T).view(m, 1, heads, width))
-    dr = rotate((norm_difference(x, delta) @ w_q.T).view(m, probes, heads, width))
+    dr = rotate(move_product(norm_difference(x, delta), w_q.T).view(m, probes, heads, width))
     sq = r0.square().sum(-1, keepdim=True)
     inv0 = torch.rsqrt(sq / width + EPS)
     inv = torch.rsqrt((sq + 2 * (r0 * dr).sum(-1, keepdim=True) + dr.square().sum(-1, keepdim=True)) / width + EPS)
@@ -434,7 +435,12 @@ def query_change(x, delta, pos, rel, w_q, keys, values, w_proj_t, cos, sin, wind
     ds = torch.einsum('mphd,htd->mpht', dq.to(keys.dtype), keys).float() * width ** -0.5
     dlse = torch.log1p((p0 * torch.expm1(ds)).sum(-1, keepdim=True))
     dout = torch.einsum('mpht,htd->mphd', (p0 * torch.expm1(ds - dlse)).to(values.dtype), values).float()
-    return dout.flatten(-2) @ w_proj_t
+    return move_product(dout.flatten(-2), w_proj_t)
+
+
+def move_product(move, weight):
+    """A replayed move times a clean weight, in MOVE_DTYPE with an fp32 result."""
+    return (move.to(MOVE_DTYPE) @ weight.to(MOVE_DTYPE)).float()
 
 
 @cache
@@ -544,12 +550,12 @@ def query_change_routed(x, delta, pos, w_q, top_keys, top_values, top_p, rest, w
     rotate = lambda u: torch.cat([u[..., :width // 2] * c + u[..., width // 2:] * s,
                                   u[..., :width // 2] * -s + u[..., width // 2:] * c], -1)
     r0 = rotate((norm(x) @ w_q.T).view(m, 1, heads, width))
-    dr = rotate((norm_difference(x, delta) @ w_q.T).view(m, probes, heads, width))
+    dr = rotate(move_product(norm_difference(x, delta), w_q.T).view(m, probes, heads, width))
     sq = r0.square().sum(-1, keepdim=True)
     inv0 = torch.rsqrt(sq / width + EPS)
     inv = torch.rsqrt((sq + 2 * (r0 * dr).sum(-1, keepdim=True) + dr.square().sum(-1, keepdim=True)) / width + EPS)
     dq = dr * inv + r0 * (inv - inv0)
-    return routed_output_change(dq, top_keys, top_values, top_p, rest).flatten(-2) @ w_proj_t
+    return move_product(routed_output_change(dq, top_keys, top_values, top_p, rest).flatten(-2), w_proj_t)
 
 
 def routed_output_change(dq, top_keys, top_values, top_p, rest):
@@ -616,6 +622,7 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
 chain_chunk = torch.compile(chain_chunk_eager, dynamic=False)
 chain_chunk_own = torch.compile(chain_chunk_eager, dynamic=True)
 KEY_BUCKET = 256
+MOVE_DTYPE = torch.bfloat16  # the own-query move products of the chain replay (Settings.own_query_precision)
 
 
 @torch.compile(dynamic=False)
@@ -1503,6 +1510,8 @@ class Cut(Boost):
         self._input_key_errors = None
         self.measured = {}  # Last step's diagnostic credits are not inputs to this estimate.
         self.routed = {}  # chain_credits' routed own-query contexts, reused by the future probes
+        global MOVE_DTYPE  # read by the compiled chain replay
+        MOVE_DTYPE = torch.bfloat16 if s.own_query_precision == 'bf16' else torch.float32
         d.capture(x, y)
         L = model.config.n_layer
         b, t = x.shape
