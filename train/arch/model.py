@@ -49,6 +49,7 @@ class GPTConfig:
     n_embd: int = 512
     # Per block, repeating: S = half-sequence window, L = full. The last block is always L.
     window_pattern: str = 'SSSL'
+    feedback: bool = True  # the full-bandwidth second pass
     # n-gram memory: n = 2..ngram_max, each hashed into ngram_heads tables of about ngram_rows rows (Engram's
     # 5x the vocabulary); ngram_max < 2 turns it off.
     ngram_max: int = 3
@@ -185,7 +186,8 @@ class GPT(nn.Module):
             'h': nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)  # untied from the embedding
-        self.feedback = nn.Linear(config.n_embd, config.n_embd, bias=False)  # h[t-1] into position t's embedding
+        # h[t-1] into position t's embedding, on the second pass
+        self.feedback = nn.Linear(config.n_embd, config.n_embd, bias=False) if config.feedback else None
         self.ngram = NgramMemory(config) if config.ngram_max >= 2 else None
         # The stream entering block i is resid_lambdas[i] * x + x0_lambdas[i] * x0, a learned mix of the
         # previous block's output and the normalized token embedding.
@@ -206,7 +208,8 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        torch.nn.init.zeros_(self.feedback.weight)
+        if self.feedback is not None:
+            torch.nn.init.zeros_(self.feedback.weight)
         if self.ngram is not None:
             torch.nn.init.zeros_(self.ngram.table.weight)
         s = 3 ** 0.5 * self.config.n_embd ** (-0.5)
@@ -271,9 +274,10 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
-        h = self.stack(self.embed(idx), idx, cos_sin)
-        previous = F.pad(h[:, :-1], (0, 0, 1, 0))  # position 0 has no previous token
-        x = self.stack(self.embed(idx, previous), idx, cos_sin)
+        x = self.stack(self.embed(idx), idx, cos_sin)
+        if self.feedback is not None:
+            previous = F.pad(x[:, :-1], (0, 0, 1, 0))  # position 0 has no previous token
+            x = self.stack(self.embed(idx, previous), idx, cos_sin)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # soft cap
         if targets is not None:

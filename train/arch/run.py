@@ -750,7 +750,7 @@ class Capture:
             # Track 3: the hooks kept the second pass, whose embedding is wte + n-grams + feedback(h[t-1]),
             # recomputed as the forward did; every embedding probe moves that sum, and h[t-1] (the first
             # pass) is a fixed input, like the token
-            self.outputs['transformer.wte'] = self.model.embed(x, self.inputs['feedback'])
+            self.outputs['transformer.wte'] = self.model.embed(x, self.inputs.get('feedback'))
             self.x0 = norm(self.outputs['transformer.wte'])
 
     def head_error(self, sigma=0.1):
@@ -784,7 +784,8 @@ class Capture:
             ids = inputs('ngram.table').reshape(credit.shape[0], -1)
             error = credit.unsqueeze(1).expand(-1, self.model.ngram.orders, -1)
             grad('ngram.table').index_add_(0, ids.reshape(-1), error.reshape(ids.numel(), -1))
-        grad('feedback').addmm_(credit.T, inputs('feedback').reshape(credit.shape[0], -1))
+        if 'feedback' in self.inputs:
+            grad('feedback').addmm_(credit.T, inputs('feedback').reshape(credit.shape[0], -1))
 
 class Boost:
     """Phase 1: stagewise credit, each sub-block against the shared head reading the stream right after it."""
