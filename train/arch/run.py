@@ -835,10 +835,9 @@ class Capture:
         finally:
             self.capturing = False
         with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == 'cuda'):
-            # Track 3: the hooks kept the second pass, whose embedding is wte + n-grams + feedback(h[t-1]),
-            # recomputed as the forward did; every embedding probe moves that sum, and h[t-1] (the first
-            # pass) is a fixed input, like the token
-            self.outputs['transformer.wte'] = self.model.embed(x, self.inputs.get('feedback'))
+            # Track 3: the embedding is wte + n-grams, recomputed as the forward did; every embedding probe
+            # moves that sum
+            self.outputs['transformer.wte'] = self.model.embed(x)
             self.x0 = norm(self.outputs['transformer.wte'])
 
     def head_error(self, sigma=0.1):
@@ -856,8 +855,8 @@ class Capture:
 
     def embedding_gradients(self, gradients, credit, sequence=None):
         """Add the gradients of everything summed into the embedding, from the credit there ([batch, token,
-        width], or sequence `sequence`'s [token, width]): token and n-gram rows index it, feedback multiplies it
-        by h[t-1]. None of them takes a step through a nonlinearity."""
+        width], or sequence `sequence`'s [token, width]): token and n-gram rows index it. Neither takes a step
+        through a nonlinearity."""
         def inputs(site):
             return self.inputs[site] if sequence is None else self.inputs[site][sequence]
 
@@ -872,8 +871,6 @@ class Capture:
             ids = inputs('ngram.table').reshape(credit.shape[0], -1)
             error = credit.unsqueeze(1).expand(-1, self.model.ngram.orders, -1)
             grad('ngram.table').index_add_(0, ids.reshape(-1), error.reshape(ids.numel(), -1))
-        if 'feedback' in self.inputs:
-            grad('feedback').addmm_(credit.T, inputs('feedback').reshape(credit.shape[0], -1))
 
 class Boost:
     """Phase 1: stagewise credit, each sub-block against the shared head reading the stream right after it."""
@@ -1645,7 +1642,7 @@ class Cut(Boost):
             # internals split or average their own: keys share dims, queries share draws, hidden units share units)
             for name in list(gradients):
                 if name == 'lm_head.weight' or name.endswith('c_proj.weight') or name in (
-                        'transformer.wte.weight', 'feedback.weight', 'ngram.table.weight', 'resid_lambdas',
+                        'transformer.wte.weight', 'ngram.table.weight', 'resid_lambdas',
                         'x0_lambdas'):
                     gradients[name] = torch.zeros_like(gradients[name])
         if s.future_draws:

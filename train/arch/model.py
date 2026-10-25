@@ -1,10 +1,4 @@
-"""Track 3's model: the 37.7M-parameter GPT of the Dust paper (8 blocks, width 512) with full-bandwidth feedback
-and an n-gram memory.
-
-Feedback follows Wang et al., "Full-bandwidth transformer" (arXiv 2608.08888), in the additive form of their
-App. O.1: a first pass runs the plain model, then a second pass adds feedback(h[t-1]) to position t's token
-embedding, h being the first pass's normalized top state. feedback starts at zero, so training starts from the
-plain model.
+"""Track 3's model: the GPT of the Dust paper (width 512) on 6 blocks instead of 8, with an n-gram memory.
 
 The n-gram memory follows DeepSeek's Engram ("Conditional Memory via Scalable Lookup"), without its gate and
 convolution: hashed rows for the last 2 and 3 tokens, added to the token embedding. It also starts at zero.
@@ -49,7 +43,6 @@ class GPTConfig:
     n_embd: int = 512
     # Per block, repeating: S = half-sequence window, L = full. The last block is always L.
     window_pattern: str = 'SSSL'
-    feedback: bool = False  # the full-bandwidth second pass (backprop ruler: no gain on top of the n-grams)
     # n-gram memory: n = 2..ngram_max, each hashed into ngram_heads tables of about ngram_rows rows (16 times
     # Engram's 5x the vocabulary: lookups cost no compute, and backprop's loss kept falling to here); ngram_max < 2
     # turns it off.
@@ -187,8 +180,6 @@ class GPT(nn.Module):
             'h': nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)  # untied from the embedding
-        # h[t-1] into position t's embedding, on the second pass
-        self.feedback = nn.Linear(config.n_embd, config.n_embd, bias=False) if config.feedback else None
         self.ngram = NgramMemory(config) if config.ngram_max >= 2 else None
         # The stream entering block i is resid_lambdas[i] * x + x0_lambdas[i] * x0, a learned mix of the
         # previous block's output and the normalized token embedding.
@@ -209,8 +200,6 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        if self.feedback is not None:
-            torch.nn.init.zeros_(self.feedback.weight)
         if self.ngram is not None:
             torch.nn.init.zeros_(self.ngram.table.weight)
         s = 3 ** 0.5 * self.config.n_embd ** (-0.5)
@@ -256,7 +245,7 @@ class GPT(nn.Module):
         return sizes
 
     def stack(self, e, idx, cos_sin):
-        """The blocks on embedding e (the token embedding, plus feedback on the second pass), ending at the final norm."""
+        """The blocks on embedding e, ending at the final norm."""
         x = norm(e)
         x0 = x
         for i, block in enumerate(self.transformer.h):
@@ -265,20 +254,17 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i])
         return norm(x)
 
-    def embed(self, idx, previous=None):
-        """The token embedding plus the n-gram memory, and on the second pass the feedback of h[t-1]."""
+    def embed(self, idx):
+        """The token embedding plus the n-gram memory."""
         e = self.transformer.wte(idx)
         if self.ngram is not None:
             e = e + self.ngram(idx).to(e.dtype)
-        return e if previous is None else e + self.feedback(previous).to(e.dtype)
+        return e
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
         x = self.stack(self.embed(idx), idx, cos_sin)
-        if self.feedback is not None:
-            previous = F.pad(x[:, :-1], (0, 0, 1, 0))  # position 0 has no previous token
-            x = self.stack(self.embed(idx, previous), idx, cos_sin)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # soft cap
         if targets is not None:
