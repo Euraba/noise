@@ -1,7 +1,10 @@
-"""Track 3's model: the GPT of the Dust paper (width 512) on 6 blocks instead of 8, with an n-gram memory.
+"""Track 3's model: the GPT of the Dust paper (width 512) on 4 blocks instead of 8, with an n-gram memory and
+in-context match tables.
 
 The n-gram memory follows DeepSeek's Engram ("Conditional Memory via Scalable Lookup"), without its gate and
 convolution: hashed rows for the last 2 and 3 tokens, added to the token embedding. It also starts at zero.
+The match tables (cache_ids) embed, for orders 1-4, the token that followed the last earlier occurrence of the
+position's last o tokens in its sequence: the induction a two-layer circuit learns, by lookup. They also start at zero.
 eval.py scores this module with --model train/arch/model.py.
 """
 from dataclasses import dataclass
@@ -37,18 +40,22 @@ def attention(q, k, v, window):
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 4096
-    n_layer: int = 6  # two blocks fewer than Dust's 8: the n-gram tables more than make up the loss
+    n_layer: int = 4  # half of Dust's 8: the n-gram and match tables more than make up the loss
     n_head: int = 8
     n_kv_head: int = 8
     n_embd: int = 512
     # Per block, repeating: S = half-sequence window, L = full. The last block is always L.
     window_pattern: str = 'SSSL'
-    # n-gram memory: n = 2..ngram_max, each hashed into ngram_heads tables of about ngram_rows rows (16 times
+    # n-gram memory: n = 2..ngram_max, each hashed into ngram_heads tables of about ngram_rows rows (32 times
     # Engram's 5x the vocabulary: lookups cost no compute, and backprop's loss kept falling to here); ngram_max < 2
     # turns it off.
     ngram_max: int = 3
     ngram_heads: int = 8
-    ngram_rows: int = 16 * 5 * 4096
+    ngram_rows: int = 32 * 5 * 4096
+    # In-context matches: for each order o, the token that followed the last cache_back earlier occurrences of the
+    # position's last o tokens in its sequence, each embedded by its own table (cache_ids). Empty turns it off.
+    cache_orders: tuple = (1, 2, 3, 4)
+    cache_back: int = 1
 
 
 def norm(x):
@@ -99,6 +106,27 @@ class NgramMemory(nn.Module):
     def forward(self, idx):
         B, T = idx.shape
         return self.table(self.ids(idx)).view(B, T, self.orders, -1).sum(2)
+
+
+def cache_ids(idx, order, vocab, back=1):
+    """A cache language model's induction (Kuhn & De Mori 1990): for each position, the token that followed the
+    back-th last earlier occurrence of its last `order` tokens in the same row, or vocab when there is none. It reads
+    token ids only (a sort, no learned key), so a probe never passes through it; the tables it indexes take the
+    embedding's credit by a gather."""
+    B, T = idx.shape
+    key = idx.long()
+    for k in range(1, order):
+        key = key * (vocab + 1) + F.pad(idx[:, :-k].long(), (k, 0), value=vocab)
+    flat = ((key * B + torch.arange(B, device=idx.device)[:, None]) * T + torch.arange(T, device=idx.device)).view(-1)
+    order_ = flat.argsort()
+    same = (flat // T)[order_]
+    last = torch.full_like(order_, -1)
+    last[order_[1:]] = torch.where(same[1:] == same[:-1], order_[:-1], torch.full_like(order_[:-1], -1))
+    prev = last
+    for _ in range(back - 1):
+        prev = torch.where(prev >= 0, last[prev.clamp(min=0)], prev)
+    nxt = idx.reshape(-1)[(prev + 1).clamp(max=B * T - 1)]
+    return torch.where(prev >= 0, nxt, torch.full_like(nxt, vocab)).view(B, T)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -181,6 +209,9 @@ class GPT(nn.Module):
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)  # untied from the embedding
         self.ngram = NgramMemory(config) if config.ngram_max >= 2 else None
+        # 'ngram' in the name: the n-gram tables' Adam rate
+        self.ngram_cache = nn.ModuleDict({f'o{o}k{k}': nn.Embedding(config.vocab_size + 1, config.n_embd)
+                                          for o in config.cache_orders for k in range(1, config.cache_back + 1)})
         # The stream entering block i is resid_lambdas[i] * x + x0_lambdas[i] * x0, a learned mix of the
         # previous block's output and the normalized token embedding.
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -202,6 +233,8 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         if self.ngram is not None:
             torch.nn.init.zeros_(self.ngram.table.weight)
+        for table in self.ngram_cache.values():
+            torch.nn.init.zeros_(table.weight)
         s = 3 ** 0.5 * self.config.n_embd ** (-0.5)
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -225,6 +258,7 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
             if self.ngram is not None:
                 self.ngram.to(dtype=torch.bfloat16)
+            self.ngram_cache.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
 
@@ -255,10 +289,13 @@ class GPT(nn.Module):
         return norm(x)
 
     def embed(self, idx):
-        """The token embedding plus the n-gram memory."""
+        """The token embedding plus the n-gram memory and the in-context match tables."""
         e = self.transformer.wte(idx)
         if self.ngram is not None:
             e = e + self.ngram(idx).to(e.dtype)
+        for name, table in self.ngram_cache.items():
+            order, back = map(int, name[1:].split('k'))
+            e = e + table(cache_ids(idx, order, self.config.vocab_size, back)).to(e.dtype)
         return e
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
